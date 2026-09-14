@@ -1,0 +1,15 @@
+# conda env create -f environment.yml
+# Torch is installed by setup_env.ps1 afterwards, from the CUDA 12.8 wheel index,
+# because conda-forge does not carry sm_120 (Blackwell) builds yet.
+name: icinspect
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pillow
+  - pyyaml
+  - matplotlib
+  - pip:
+      - pytest>=8

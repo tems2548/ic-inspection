@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Trained models, logs, reports -- regenerate, do not commit
+results/
+lightning_logs/
+*.ckpt
+*.pt
+
+# The dataset lives on the Desktop, outside this repo. Never vendor it in.
+data/
+dataset/

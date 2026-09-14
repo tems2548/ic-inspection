@@ -1,0 +1,78 @@
+# CRNN + CTC recognizer for IC top-marking text (one text line per crop).
+charset:
+  # Characters the model can output. Blank (CTC) is added automatically at index 0.
+  symbols: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-+./ "
+  uppercase: true                   # labels are upper-cased before encoding
+
+image:
+  height: 32                        # CRNN input height (fixed)
+  width: 160                        # CRNN input width (fixed, right-padded)
+  grayscale: true
+
+model:
+  rnn_hidden: 256
+  rnn_layers: 2
+  dropout: 0.1
+
+decode:
+  # Characters the model scores below this are left out of the reported text
+  # (0.0 = report everything). The score is per character: the strongest CTC
+  # frame behind it. 0.95 was measured on the NE555P captures -- it removes the
+  # logo junk and the guessed-at lot code while leaving the part number intact,
+  # at the cost of ~0.7% sequence accuracy on clean synthetic crops.
+  min_char_confidence: 0.95
+
+  # A marking segment (a run of characters with no wide gap in it) where at
+  # least this share of the decoded characters were unsure is ignored whole,
+  # rather than reported as the one or two characters that happened to score
+  # well. This is what makes the reader skip a manufacturer logo.
+  max_unsure_frac: 0.5
+
+segment:
+  # Splitting a whole chip photo into single text lines (icinspect.ocr.infer --split).
+  mode: "auto"                      # default for the config; the CLI --split flag wins
+  max_lines: 0                      # auto: 0 = keep every line found | half: strips (0 -> 2)
+  ink_frac: 0.02                    # min coverage counting as content (chip search), and the flat-profile floor
+  line_threshold: 0.80              # fraction of the automatic (Otsu) level a line row must reach
+  smooth_frac: 0.01                 # projection-profile smoothing window, fraction of the dimension
+  min_contrast: 0.05                # a stroke must beat the local background by this much of full scale
+  min_line_frac: 0.05               # bands thinner than this fraction of the height are noise
+  merge_gap_frac: 0.02              # blank runs shorter than this join two bands
+  split_gap_frac: 0.40              # cut a line where a gap exceeds this many line heights (0 = never)
+  pad_frac: 0.25                    # vertical padding around a line, as a fraction of its height
+  background_blur: 0.06             # illumination-estimate blur radius, fraction of the height
+  trim_columns: true                # also cut leading/trailing blank columns
+  chip_detect: true                 # crop to the package body before looking for text lines
+  chip_body_frac: 0.50              # a body row/column is this full of foreground; a lead row is not
+  chip_inset: 0.08                  # pull the crop in off the moulding edge, fraction of the box
+
+train:
+  epochs: 40
+  batch_size: 32
+  lr: 0.001
+  weight_decay: 0.0
+  num_workers: 0                    # Windows-safe default
+  val_split: 0.1                    # used only when no explicit val.txt exists
+  seed: 42
+  early_stop_patience: 8
+  grad_clip: 5.0
+  amp: true                         # mixed precision on CUDA
+  output_dir: "results/ocr"
+
+augment:
+  enabled: true
+  rotate_deg: 3.0
+  scale_jitter: 0.08
+  brightness: 0.25
+  contrast: 0.25
+  blur_prob: 0.3
+  noise_std: 0.03
+
+synth:
+  # Synthetic IC-marking generator (scripts/gen_synth_ocr.py)
+  count: 5000
+  fonts_dir: "C:/Windows/Fonts"
+  fonts: ["arial.ttf", "arialbd.ttf", "consola.ttf", "cour.ttf", "seguisb.ttf", "tahoma.ttf"]
+  min_len: 3
+  max_len: 12
+  seed: 1234

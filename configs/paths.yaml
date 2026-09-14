@@ -1,0 +1,12 @@
+# Dataset lives OUTSIDE the code repo, on the Desktop.
+# ~ is expanded, so this is the right folder on any machine.
+# Override at runtime with the IC_DATASET_ROOT environment variable.
+dataset_root: "~/Desktop/ic-dataset"
+
+# Sub-trees inside dataset_root (relative paths).
+anomaly_subdir: "anomaly/ic"
+ocr_subdir: "ocr"
+raw_subdir: "raw"
+
+# Outputs (models, logs, reports) stay inside the project.
+results_dir: "results"

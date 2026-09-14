@@ -1,0 +1,43 @@
+# PatchCore (anomalib) configuration for IC surface / package defect detection.
+dataset:
+  # Folder names under <dataset_root>/anomaly/ic
+  normal_dir: "train/good"          # defect-free images used to build the memory bank
+  normal_test_dir: "test/good"      # defect-free images held out for testing
+  abnormal_dir: "test/defect"       # defective images
+  mask_dir: "ground_truth/defect"   # optional pixel masks; ignored if empty
+  extensions: [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
+  train_batch_size: 8
+  eval_batch_size: 8
+  num_workers: 0                    # keep 0 on Windows unless you guard __main__
+  seed: 42
+
+model:
+  backbone: "wide_resnet50_2"
+  layers: ["layer1", "layer2", "layer3"]
+  pre_trained: true
+  coreset_sampling_ratio: 0.15       # lower = smaller memory bank, faster inference
+  num_neighbors: 9
+
+image:
+  size: [384, 384]                  # [height, width] fed to the backbone
+  center_crop: [384, 384]                # e.g. [224, 224] or null
+
+trainer:
+  accelerator: "auto"               # "gpu" | "cpu" | "auto"
+  devices: 1
+  max_epochs: 1                     # PatchCore is one-pass: 1 epoch is correct
+  default_root_dir: "results/patchcore"
+
+threshold:
+  # null -> use the F1AdaptiveThreshold anomalib computes during validation.
+  # Set a float to pin the image-level score cutoff used by infer_patchcore.py.
+  image_score: null
+
+  # Cutoff for the part-only score, used when the window scores the package and
+  # ignores the fixture around it. It needs its own number: anomalib fits
+  # image_score over the whole frame, where the brightest patch is often the
+  # halo around the part, so that line sits well above anything the package
+  # alone reaches. Fit it from test/good + test/defect with "Calibrate" on the
+  # Inspect tab; null means the window falls back to anomalib's pixel line
+  # (0.50), which is the right scale but the wrong calibration.
+  part_score: 0.3902   # fitted 2026-09-11: 46 good + 220 defective, fixed region, F1 1.00
