@@ -11,7 +11,7 @@ region by hand, or `--split none` when the input is already a single-line crop.
 
 Either check can be disabled, so this also works as OCR-only or anomaly-only.
 
-    python -m icinspect.pipeline --input "%USERPROFILE%/Desktop/ic-dataset/raw"
+    python -m icinspect.pipeline --input "%USERPROFILE%/Desktop/ic/ic-dataset/raw"
     python -m icinspect.pipeline --input board.png --expect NE555P
     python -m icinspect.pipeline --input board.png --expect STM32F407VGT6 --roi 0.15 0.35 0.85 0.6
 """

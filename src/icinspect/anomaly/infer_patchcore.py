@@ -1,7 +1,7 @@
 """Score new IC images with a trained PatchCore checkpoint.
 
     python -m icinspect.anomaly.infer_patchcore --ckpt results/patchcore/.../model.ckpt \
-        --input "%USERPROFILE%/Desktop/ic-dataset/raw"
+        --input "%USERPROFILE%/Desktop/ic/ic-dataset/raw"
 """
 
 from __future__ import annotations

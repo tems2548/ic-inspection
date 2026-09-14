@@ -10,7 +10,7 @@ Two independent checks for integrated circuits, both in Python:
 `icinspect.pipeline` runs both and emits a PASS/FAIL report.
 
 Code lives here. **The dataset lives outside this folder**, at
-`%USERPROFILE%\Desktop\ic-dataset`, so images never end up in version control.
+`%USERPROFILE%\Desktop\ic\ic-dataset`, so images never end up in version control.
 
 ---
 
@@ -284,7 +284,7 @@ Anomalib supports Python 3.10–3.12 (your base is 3.13), and the RTX 5060 Ti is
 Blackwell/`sm_120`, which needs CUDA 12.8 PyTorch wheels. The setup script handles both:
 
 ```powershell
-cd %USERPROFILE%\Desktop\ic-inspection
+cd %USERPROFILE%\Desktop\ic\ic-inspection
 powershell -ExecutionPolicy Bypass -File .\setup_env.ps1
 conda activate icinspect
 ```
@@ -309,7 +309,7 @@ python scripts\init_dataset.py
 Builds this tree on the Desktop, next to the project:
 
 ```
-%USERPROFILE%\Desktop\ic-dataset\
+%USERPROFILE%\Desktop\ic\ic-dataset\
 ├── anomaly\ic\
 │   ├── train\good\           defect-free images  -> PatchCore memory bank
 │   ├── test\good\            defect-free, held out
@@ -342,7 +342,7 @@ Training takes seconds to a couple of minutes. Results land in `results\patchcor
 Score new images:
 
 ```powershell
-python -m icinspect.anomaly.infer_patchcore --input "%USERPROFILE%\Desktop\ic-dataset\raw"
+python -m icinspect.anomaly.infer_patchcore --input "%USERPROFILE%\Desktop\ic\ic-dataset\raw"
 ```
 
 Writes `results\patchcore\predictions.csv` with a score per image. Without a test set,
@@ -375,7 +375,7 @@ python -m icinspect.ocr.train --labels train.txt --resume results\ocr\crnn_best.
 Read images:
 
 ```powershell
-python -m icinspect.ocr.infer --input "%USERPROFILE%\Desktop\ic-dataset\ocr\images"
+python -m icinspect.ocr.infer --input "%USERPROFILE%\Desktop\ic\ic-dataset\ocr\images"
 python -m icinspect.ocr.infer --input ... --labels test.txt   # reports char/seq accuracy
 ```
 
@@ -471,10 +471,10 @@ lines (part number, then date/lot code) surrounded by background and leads.
 
 ```powershell
 # a photo of one chip on the fixture
-python -m icinspect.ocr.infer --input "%USERPROFILE%\Desktop\ic-dataset\raw\P00001.jpg" --split auto
+python -m icinspect.ocr.infer --input "%USERPROFILE%\Desktop\ic\ic-dataset\raw\P00001.jpg" --split auto
 
 # a whole folder of captures
-python -m icinspect.ocr.infer --input "%USERPROFILE%\Desktop\ic-dataset\raw" --split auto
+python -m icinspect.ocr.infer --input "%USERPROFILE%\Desktop\ic\ic-dataset\raw" --split auto
 
 # exactly two lines: cut at the midline, top and bottom
 python -m icinspect.ocr.infer --input chip.png --split half
@@ -560,7 +560,7 @@ no readable marking still produces a row with a low confidence to reject on.
 
 ```powershell
 # both checks, whole folder
-python -m icinspect.pipeline --input "%USERPROFILE%\Desktop\ic-dataset\raw"
+python -m icinspect.pipeline --input "%USERPROFILE%\Desktop\ic\ic-dataset\raw"
 
 # verify a specific part, reading only the marking region of each image
 python -m icinspect.pipeline --input .\board.png --expect STM32F407VGT6 --roi 0.15 0.35 0.85 0.60

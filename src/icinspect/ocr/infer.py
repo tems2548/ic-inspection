@@ -2,7 +2,7 @@
 
 Pre-cut single-line crops:
 
-    python -m icinspect.ocr.infer --input "%USERPROFILE%/Desktop/ic-dataset/ocr/images"
+    python -m icinspect.ocr.infer --input "%USERPROFILE%/Desktop/ic/ic-dataset/ocr/images"
 
 Whole photos of a chip -- cropped to the package, then split into text lines:
 
