@@ -17,7 +17,7 @@ from tkinter import messagebox, ttk
 from icinspect.config import CONFIG_DIR, PROJECT_ROOT
 from icinspect.gui import widgets as w
 from icinspect.gui.runner import Worker
-from icinspect.gui.service import Inspector
+from icinspect.gui.service import REGION_MANUAL, REGION_REFERENCE, Inspector
 
 QUICK_START = """\
 1. Setup tab - point at your dataset folder and press "Create the folders",
@@ -131,6 +131,7 @@ class App(tk.Tk):
         tools.add_separator()
         tools.add_command(label="Reload configs and models", command=self._reload)
         tools.add_command(label="Relearn the scored region", command=self._relearn_region)
+        tools.add_command(label="Forget the drawn box", command=self._forget_box)
         bar.add_cascade(label="Tools", menu=tools)
 
         help_menu = tk.Menu(bar, tearoff=False)
@@ -196,6 +197,14 @@ class App(tk.Tk):
         self.inspector.forget_region()
         self.log("[part] scored region forgotten; it is measured again on the next run")
         self.models_changed()
+
+    def _forget_box(self) -> None:
+        """Drop the package box drawn by hand; the learned region takes over."""
+        self.inspector.clear_manual_region()
+        if self.inspect_tab.region_mode.get() == REGION_MANUAL:
+            self.inspect_tab.region_mode.set(REGION_REFERENCE)
+        self.log("[part] drawn box forgotten; the region learned from the good parts is used")
+        self.inspect_tab.refresh_state()
 
     def _quick_start(self) -> None:
         messagebox.showinfo("Quick start", QUICK_START, parent=self)

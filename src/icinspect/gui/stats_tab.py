@@ -2,9 +2,12 @@
 
 Two halves. The left is about *this* inspection -- score distribution, reader
 confidence, what failed and why -- and fills in from whatever is currently on
-the Inspect tab. The right is about the models on disk: the training history the
-reader wrote, and every hyperparameter both models actually carry, which is the
-thing to check first when a number looks wrong.
+the Inspect tab. The right starts with the reporting table -- the seven numbers
+a qualification report asks for (see `icinspect.gui.report`), each with the
+count and interval it rests on or the reason it is blank -- and continues with
+the models on disk: the training history the reader wrote, and every
+hyperparameter both models actually carry, which is the thing to check first
+when a number looks wrong.
 
 matplotlib is imported when the tab is first shown, not at startup: the window
 should open in under a second even though this tab costs a second on its own.
@@ -17,6 +20,7 @@ from tkinter import messagebox, ttk
 
 from icinspect.gui import charts
 from icinspect.gui.heatmap import THRESHOLD
+from icinspect.gui.report import ReportTable, build_table
 from icinspect.gui.stats import RunStats, ocr_facts, ocr_history, patchcore_facts, run_stats
 
 
@@ -72,11 +76,12 @@ class StatsTab(ttk.Frame):
     def _build_actions(self) -> None:
         bar = ttk.Frame(self)
         bar.grid(row=1, column=0, sticky="ew", pady=(6, 6))
-        bar.columnconfigure(2, weight=1)
+        bar.columnconfigure(3, weight=1)
         ttk.Button(bar, text="Refresh", command=self.refresh_state).grid(row=0, column=0)
         ttk.Button(bar, text="Save charts as PNG...", command=self._export).grid(row=0, column=1, padx=6)
+        ttk.Button(bar, text="Copy reporting table", command=self._copy_report).grid(row=0, column=2)
         self.note = ttk.Label(bar, text="", foreground=charts.MUTED)
-        self.note.grid(row=0, column=2, sticky="w", padx=8)
+        self.note.grid(row=0, column=3, sticky="w", padx=8)
 
     def _build_body(self) -> None:
         panes = ttk.PanedWindow(self, orient="horizontal")
@@ -93,8 +98,28 @@ class StatsTab(ttk.Frame):
         panes.add(self.chart_frame, weight=3)
 
         right = ttk.Frame(panes)
-        right.rowconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
+
+        # The reporting table first: seven fixed rows, so it never scrolls.
+        # A blank row says what would fill it, in the basis column.
+        box = ttk.LabelFrame(right, text="Reporting table", padding=(4, 2))
+        box.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        box.columnconfigure(0, weight=1)
+        report = ttk.Treeview(box, columns=("value", "basis"), show="tree headings",
+                              selectmode="browse", height=7)
+        report.heading("#0", text="metric")
+        report.heading("value", text="value")
+        report.heading("basis", text="basis")
+        report.column("#0", width=150, stretch=False)
+        report.column("value", width=150, stretch=False)
+        report.column("basis", width=260)
+        report.tag_configure("headline", foreground=charts.INK, font=("Segoe UI", 9, "bold"))
+        report.tag_configure("missing", foreground=charts.MUTED)
+        report.grid(row=0, column=0, sticky="ew")
+        self.report = report
+        self._report_table: ReportTable | None = None
+
         tree = ttk.Treeview(right, columns=("value",), show="tree headings", selectmode="browse")
         tree.heading("#0", text="model")
         tree.heading("value", text="value")
@@ -103,8 +128,8 @@ class StatsTab(ttk.Frame):
         tree.tag_configure("group", foreground=charts.INK)
         scroll = ttk.Scrollbar(right, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        scroll.grid(row=0, column=1, sticky="ns")
+        tree.grid(row=1, column=0, sticky="nsew")
+        scroll.grid(row=1, column=1, sticky="ns")
         self.facts = tree
         panes.add(right, weight=2)
         # Six panels need most of the width; ttk would otherwise size the sash
@@ -196,7 +221,56 @@ class StatsTab(ttk.Frame):
         self.app.log(f"[stats] charts saved: {chosen}", "ok")
         self.note.configure(text=f"Saved {chosen}")
 
+    def _copy_report(self) -> None:
+        """The reporting table as a Markdown table on the clipboard, for a report."""
+        if self._report_table is None:
+            self.refresh_state()
+        if self._report_table is None:
+            return
+        text = self._report_table.as_markdown()
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.note.configure(text="Reporting table copied as Markdown")
+        self.app.log("[stats] reporting table copied to the clipboard", "ok")
+
     # -- numbers -----------------------------------------------------------
+
+    def _fill_report(self, results: list, facts: dict[str, str]) -> None:
+        """The seven rows of the reporting table, from this run and the config."""
+        from icinspect.gui.service import device_name
+
+        cfg = self.inspector.report_config()
+        tab = getattr(self.app, "inspect_tab", None)
+        cutoff = None
+        if tab is not None and results and getattr(tab, "ignore_background", None) \
+                and tab.ignore_background.get():
+            cutoff = self.inspector.part_cutoff(tab.options())
+        body = cfg.get("body_mm")
+        try:
+            body_mm = (float(body[0]), float(body[1])) if body else None
+        except (TypeError, ValueError, IndexError):
+            body_mm = None
+        listing = self.inspector.paths().anomaly_root / str(cfg.get("repeats_file") or "repeats.csv")
+        table = build_table(
+            results,
+            cutoff=cutoff,
+            body_mm=body_mm,
+            inset=self.inspector.chip_inset(),
+            repeats_pattern=cfg.get("repeats_pattern") or None,
+            repeats_listing=listing,
+            device=device_name(),
+            fallback_auroc=facts.get("test image AUROC"),
+        )
+        self._report_table = table
+        self.report.delete(*self.report.get_children())
+        for row in table.rows:
+            tags = []
+            if row.metric.startswith("Detection limit"):
+                tags.append("headline")
+            if not row.available:
+                tags.append("missing")
+            self.report.insert("", "end", text=row.metric, values=(row.value, row.basis),
+                               tags=tuple(tags))
 
     def _fill_tiles(self, stats: RunStats, facts: dict[str, str]) -> None:
         self.tiles["inspected"].set(str(stats.total) if stats else "-")
@@ -302,6 +376,11 @@ class StatsTab(ttk.Frame):
             ocr, patchcore = [("error", str(exc))], []
         flat = self._fill_facts(ocr, patchcore, stats)
         self._fill_tiles(stats, flat)
+        try:
+            self._fill_report(results, flat)
+        except Exception as exc:                      # the table must never take the tab down
+            self.report.delete(*self.report.get_children())
+            self.report.insert("", "end", text="error", values=(str(exc), ""), tags=("missing",))
         self.note.configure(
             text="No inspection yet -- the training charts still show."
             if not stats else

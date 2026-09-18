@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from datetime import datetime
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -26,8 +27,10 @@ from typing import Any
 
 import numpy as np
 
+from icinspect.anomaly.shape import Shape
 from icinspect.config import load_yaml, resolve_output, resolve_paths
 from icinspect.gui.heatmap import peak
+from icinspect.gui.report import auroc
 from icinspect.gui.runner import Progress
 from icinspect.ocr.charset import cer
 from icinspect.ocr.dataset import list_images
@@ -41,13 +44,62 @@ MASK_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 # Where the scored region comes from.
 REGION_REFERENCE = "normal part"   # fixed, learned from the good training parts
 REGION_PHOTO = "this photo"        # measured on the photo being inspected
-REGION_MODES = (REGION_REFERENCE, REGION_PHOTO)
+REGION_MANUAL = "drawn box"        # fixed, drawn by hand on a photo in the window
+REGION_MODES = (REGION_REFERENCE, REGION_PHOTO, REGION_MANUAL)
 REFERENCE_FILE = "part_region.json"
+MANUAL_FILE = "manual_region.json"
+
+Region = tuple[float, float, float, float]   # x1, y1, x2, y2 as fractions of the frame
 
 
 def _box(text: str) -> Box:
     x1, y1, x2, y2 = (int(v) for v in text.split(","))
     return (x1, y1, x2, y2)
+
+
+def device_name() -> str:
+    """The hardware an inspection ran on, for the latency row of the report."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    import platform
+
+    return f"CPU ({platform.processor() or platform.machine()})"
+
+
+def _readable(images: list[Path], prog: Progress) -> list[Path]:
+    """The photos that decode in full; the rest are named in the log and dropped."""
+    from PIL import Image
+
+    good: list[Path] = []
+    for image in images:
+        try:
+            with Image.open(image) as img:
+                img.load()
+        except Exception as exc:
+            prog.log(f"[anomaly] skipping {image.name}: {exc}")
+            continue
+        good.append(image)
+    return good
+
+
+def _region_pixels(region: "Region | None", image: Path) -> Box | None:
+    """A frame-fraction region in this photo's pixels; None when there is none."""
+    if region is None:
+        return None
+    from PIL import Image
+
+    try:
+        with Image.open(image) as img:
+            width, height = img.size
+    except Exception:
+        return None
+    x1, y1, x2, y2 = region
+    return (int(x1 * width), int(y1 * height), int(x2 * width), int(y2 * height))
 
 
 @contextmanager
@@ -160,6 +212,12 @@ class Result:
     # anomaly map's resolution, when one exists under ground_truth/.
     truth: int | None = None
     truth_mask: "np.ndarray | None" = None
+    # What kind of defect the damaged area is, read off its shape (see
+    # `icinspect.anomaly.shape`). Filled in by the inspection; None until then.
+    shape: "Shape | None" = None
+    # Wall time this photo cost with the models already loaded: its share of
+    # the batched anomaly pass plus its own marking read and shape analysis.
+    seconds: float | None = None
 
     @property
     def deciding_score(self) -> float | None:
@@ -274,7 +332,15 @@ class Result:
             "iou": "" if self.iou is None else self.iou,
             "decided_on": "part" if (self.part_decides and self.part_score is not None) else "frame",
             "part": "" if self.part is None else "{:.4f},{:.4f},{:.4f},{:.4f}".format(*self.part),
+            "defect_kind": "" if self.shape is None else self.shape.kind,
+            "defect_detail": "" if self.shape is None else self.shape.describe(),
+            "defect_blobs": "" if self.shape is None else self.shape.count,
         }
+
+    @property
+    def kind(self) -> str:
+        """The defect kind's label for the window, blank when not analysed."""
+        return "" if self.shape is None else self.shape.label
 
 
 @dataclass
@@ -317,6 +383,9 @@ class Inspector:
         self.ocr_override: Path | None = None
         self.anomaly_override: Path | None = None
         self._reference: tuple[float, float, float, float] | None = None
+        # The box drawn by hand, once read from disk; False until then, since
+        # "read and found nothing" is a different state from "not read yet".
+        self._manual: Region | None | bool = False
         # Cutoff for the part-only score, once calibrated in this session.
         # Excluding the background changes what is measured, so the threshold
         # anomalib fitted over whole frames no longer applies to it.
@@ -392,6 +461,7 @@ class Inspector:
         self._ocr = None
         self._anomaly = None
         self._reference = None      # re-read from the cache, not re-measured
+        self._manual = False
 
     # -- OCR ---------------------------------------------------------------
 
@@ -445,6 +515,10 @@ class Inspector:
         run_cfg = self._ocr_run_config(ckpt_cfg, opts)
         max_unsure = max_unsure_frac(run_cfg)
         crops_dir = self.ocr_dir() / "crops" if opts.save_crops else None
+        # In drawn-box mode the box is the package for the reader as well: the
+        # fixture puts every part in the same place, and a hand-drawn box does
+        # not wander off a part the detector cannot make sense of.
+        pinned = self.manual_region() if opts.part_region_mode == REGION_MANUAL else None
 
         def read(image: Path) -> tuple[Box | None, list[Segment]]:
             if opts.split == "none":
@@ -459,6 +533,7 @@ class Inspector:
                 model, charset, run_cfg, [image], device, opts.split, crops_dir,
                 detect_chip=opts.detect_chip,
                 drop_unreadable=False,   # flagged instead, so the UI can show what was skipped
+                chip_box=_region_pixels(pinned, image),
             )
             chip: Box | None = None
             segments: list[Segment] = []
@@ -528,6 +603,12 @@ class Inspector:
         # was picked, so a partial selection is hardlinked into a scratch folder
         # first -- seconds instead of half a minute for a single part.
         scored: dict[str, dict] = {}
+        # A truncated capture would stop anomalib's whole pass; it is left out
+        # here and comes back as "anomaly-missing" with the reason in the log.
+        images = _readable(images, prog)
+        if not images:
+            return scored
+        started = time.perf_counter()
         with torch.no_grad(), _staging(images) as (folders, back):
             for i, folder in enumerate(folders):
                 prog.check()
@@ -540,6 +621,10 @@ class Inspector:
                             row["image"] = key
                             row.update(maps[position] if position < len(maps) else {})
                             scored[key] = row
+        # The pass is batched, so each photo is charged an equal share of it.
+        share = (time.perf_counter() - started) / max(len(scored), 1)
+        for row in scored.values():
+            row["seconds"] = share
 
         threshold = opts.threshold
         if threshold is None:
@@ -631,6 +716,52 @@ class Inspector:
         except OSError:
             pass
 
+    # -- the box drawn by hand ----------------------------------------------
+
+    def manual_region(self) -> Region | None:
+        """The box drawn on a photo in the window, as fractions of the frame.
+
+        Kept beside the learned one, in its own file, so relearning the region
+        after the fixture moves does not also throw away what was drawn.
+        """
+        if self._manual is not False:
+            return self._manual                      # type: ignore[return-value]
+        self._manual = None
+        cache = self.patchcore_dir() / MANUAL_FILE
+        if cache.exists():
+            try:
+                saved = json.loads(cache.read_text(encoding="utf-8"))
+                region = tuple(float(v) for v in saved["region"])
+                if len(region) == 4 and region[2] > region[0] and region[3] > region[1]:
+                    self._manual = region            # type: ignore[assignment]
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        return self._manual                          # type: ignore[return-value]
+
+    def set_manual_region(self, region: Region, drawn_on: Path | None = None) -> Region:
+        """Keep a box drawn by hand, clamped to the frame, and remember it on disk."""
+        x1, y1, x2, y2 = (min(1.0, max(0.0, float(v))) for v in region)
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError("The box has no area.")
+        self._manual = (x1, y1, x2, y2)
+        cache = self.patchcore_dir() / MANUAL_FILE
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({
+            "region": list(self._manual),
+            "source": "drawn by hand",
+            "drawn_on": None if drawn_on is None else str(drawn_on),
+            "computed": datetime.now().isoformat(timespec="seconds"),
+        }, indent=2), encoding="utf-8")
+        return self._manual
+
+    def clear_manual_region(self) -> None:
+        """Throw the drawn box away, in memory and on disk."""
+        self._manual = None
+        try:
+            (self.patchcore_dir() / MANUAL_FILE).unlink(missing_ok=True)
+        except OSError:
+            pass
+
     @staticmethod
     def _part_from_chip(chip: Box | None, image: Path) -> tuple[float, float, float, float] | None:
         """The marking reader's package box, expressed as fractions of the frame."""
@@ -707,7 +838,8 @@ class Inspector:
             raise ValueError("Nothing scored: is the detector trained?")
 
         best = _best_f1(scored)
-        best["auroc"] = _auroc(scored)
+        area = auroc(scored)
+        best["auroc"] = float("nan") if area is None else round(area, 4)
         best["good"] = len(good)
         best["defect"] = len(bad)
         best["found_part"] = sum(1 for r in results if r.part is not None)
@@ -740,6 +872,49 @@ class Inspector:
             return None
         x1, y1, x2, y2 = box
         return (x1 / width, y1 / height, x2 / width, y2 / height)
+
+    def shape_of(self, result: Result) -> "Shape | None":
+        """Name the kind of defect on one result from the shape of its damage.
+
+        The photo is decoded at a quarter of its size -- enough for the package
+        finder, which works at 512 px wide anyway, and for the backdrop check,
+        which works at the map's resolution -- so this costs tens of
+        milliseconds per photo rather than the half second a 4K decode takes.
+        """
+        from PIL import Image
+
+        from icinspect.anomaly.shape import analyse, body_fraction
+
+        damage = result.damage
+        if damage is None:
+            return None
+        photo = None
+        body = None
+        try:
+            with Image.open(result.path) as img:
+                width, height = img.size
+                img.draft("L", (max(width // 4, 512), max(height // 4, 288)))
+                photo = img.convert("L")
+        except Exception:                 # a truncated capture: shape only
+            photo = None
+        if photo is not None:
+            body = body_fraction(photo, result.part, load_yaml(self.ocr_config))
+        return analyse(damage, result.heat, result.part, width / height if photo else None,
+                       photo=photo, body_frac=body)
+
+    def report_config(self) -> dict:
+        """The `report:` block of patchcore.yaml (mm scale, repeated-shot grouping)."""
+        block = load_yaml(self.patchcore_config).get("report") or {}
+        return dict(block) if isinstance(block, dict) else {}
+
+    def chip_inset(self) -> float:
+        """How far the package finder pulls its box in off the moulding edge."""
+        from icinspect.ocr.segment import segment_config
+
+        try:
+            return float(segment_config(load_yaml(self.ocr_config)).get("chip_inset", 0.0))
+        except Exception:
+            return 0.0
 
     def truth_of(self, image: Path) -> int | None:
         """1 for a defective part, 0 for a good one, None when the folder says nothing.
@@ -809,7 +984,12 @@ class Inspector:
         read = self._ocr_reader(opts, prog) if opts.check_ocr else None
         ocr_cfg = load_yaml(self.ocr_config) if opts.ignore_background else None
         reference = None
-        if opts.ignore_background and opts.part_region_mode == REGION_REFERENCE:
+        if opts.ignore_background and opts.part_region_mode == REGION_MANUAL:
+            reference = self.manual_region()
+            if reference is None and prog is not None:
+                prog.log("[part] no box has been drawn yet; using the region "
+                         "learned from the good parts instead")
+        if opts.ignore_background and reference is None and opts.part_region_mode != REGION_PHOTO:
             reference = self.reference_region(prog)
             if reference is None and prog is not None:
                 prog.log("[part] no good parts to learn the region from; "
@@ -822,11 +1002,16 @@ class Inspector:
         for index, image in enumerate(images):
             prog.check()
             key = str(image.resolve())
+            started = time.perf_counter()
             if read is None:
                 chip, segments = None, []
             else:
                 prog.status(f"Reading marking {index + 1}/{len(images)}: {image.name}")
-                chip, segments = read(image)
+                try:
+                    chip, segments = read(image)
+                except OSError as exc:          # a truncated capture: no marking, not a crash
+                    prog.log(f"[ocr] cannot read {image.name}: {exc}")
+                    chip, segments = None, []
             row = anomaly.get(key, {})
             result = Result(
                 path=image,
@@ -852,6 +1037,9 @@ class Inspector:
                 result.cutoff = part_cutoff
                 result.truth = self.truth_of(image)
                 result.truth_mask = self.truth_mask_for(image, result.heat.shape)
+                result.shape = self.shape_of(result)
+            if row or read is not None:
+                result.seconds = (time.perf_counter() - started) + float(row.get("seconds", 0.0))
             reasons: list[str] = []
             if opts.check_anomaly:
                 if not row:
@@ -899,28 +1087,6 @@ def _best_f1(scored: list[tuple[float, int]]) -> dict:
             best = {"threshold": round(cutoff, 4), "f1": round(f1, 4),
                     "precision": round(precision, 4), "recall": round(recall, 4)}
     return best
-
-
-def _auroc(scored: list[tuple[float, int]]) -> float:
-    """Rank-based AUROC, ties shared -- no sklearn needed for two columns."""
-    ranked = sorted(scored, key=lambda pair: pair[0])
-    ranks: dict[float, float] = {}
-    index = 0
-    while index < len(ranked):
-        stop = index
-        while stop + 1 < len(ranked) and ranked[stop + 1][0] == ranked[index][0]:
-            stop += 1
-        shared = (index + stop) / 2 + 1
-        for position in range(index, stop + 1):
-            ranks[position] = shared
-        index = stop + 1
-    positives = [i for i, (_s, y) in enumerate(ranked) if y == 1]
-    negatives = len(ranked) - len(positives)
-    if not positives or not negatives:
-        return float("nan")
-    rank_sum = sum(ranks[i] for i in positives)
-    auc = (rank_sum - len(positives) * (len(positives) + 1) / 2) / (len(positives) * negatives)
-    return round(auc, 4)
 
 
 def write_report(results: list[Result], path: Path, expected: str = "") -> Path:

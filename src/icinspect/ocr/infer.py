@@ -157,19 +157,21 @@ def predict_split(
     detect_chip: bool | None = None,
     drop_unreadable: bool = True,
     batch_size: int = 32,
+    chip_box: tuple[int, int, int, int] | None = None,
 ):
     """Crop to the package, segment it into text lines, then read every line.
 
     Returns (rows, ignored). One row per readable segment, top to bottom and
     left to right, with the box it was cut from -- in source-photo pixels, so
     the boxes can be drawn back onto the original. `ignored` holds the segments
-    that read as nothing but the model's guesswork.
+    that read as nothing but the model's guesswork. `chip_box` pins the package
+    (source pixels, the same for every photo in the call) instead of finding it.
     """
     rows: list[dict] = []
     ignored: list[dict] = []
     max_unsure = max_unsure_frac(cfg)
     for index, path in enumerate(image_paths):
-        lines, chip = split_image(path, mode=mode, cfg=cfg, detect_chip=detect_chip)
+        lines, chip = split_image(path, mode=mode, cfg=cfg, detect_chip=detect_chip, chip_box=chip_box)
         saved = save_crops(path, lines, crops_dir, index) if crops_dir else [None] * len(lines)
         if crops_dir and chip:
             save_chip(path, Image.open(path), chip, crops_dir, index)

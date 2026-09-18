@@ -20,9 +20,9 @@ from icinspect.gui.service import (  # noqa: E402
     Inspector,
     Options,
     Result,
-    _auroc,
     _best_f1,
 )
+from icinspect.gui.report import auroc  # noqa: E402
 
 
 def _map(hot_region=None, background=40, hot=230):
@@ -160,7 +160,7 @@ def test_best_f1_puts_the_cutoff_between_the_classes():
     best = _best_f1(scored)
     assert 0.27 < best["threshold"] <= 0.46
     assert best["f1"] == 1.0
-    assert _auroc(scored) == 1.0
+    assert auroc(scored) == 1.0
 
 
 def test_best_f1_on_overlapping_classes_trades_precision_for_recall():
@@ -172,7 +172,7 @@ def test_best_f1_on_overlapping_classes_trades_precision_for_recall():
 
 def test_auroc_is_a_half_when_the_score_says_nothing():
     scored = [(0.5, 0), (0.5, 1), (0.5, 0), (0.5, 1)]
-    assert _auroc(scored) == pytest.approx(0.5)
+    assert auroc(scored) == pytest.approx(0.5)
 
 
 def test_calibration_needs_a_labelled_test_set(tmp_path, monkeypatch):

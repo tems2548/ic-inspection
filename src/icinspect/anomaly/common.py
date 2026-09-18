@@ -33,6 +33,29 @@ def _dir_has_images(path: Path, extensions: list[str]) -> bool:
     return any(p.suffix.lower() in exts for p in path.rglob("*") if p.is_file())
 
 
+def _image_stems(path: Path, extensions: list[str]) -> dict[str, Path]:
+    exts = {e.lower() for e in extensions}
+    return {p.stem: p for p in sorted(path.rglob("*")) if p.is_file() and p.suffix.lower() in exts}
+
+
+def _mask_dir_problem(abnormal_dir: Path, mask_dir: Path, extensions: list[str]) -> str | None:
+    """Return why mask_dir cannot be handed to anomalib, or None if it is usable."""
+    masks = _image_stems(mask_dir, extensions)
+    if not masks:
+        return "no mask images found"
+    images = _image_stems(abnormal_dir, extensions)
+    missing = sorted(set(images) - set(masks))
+    extra = sorted(set(masks) - set(images))
+    if not missing and not extra:
+        return None
+    parts = [f"{len(masks)} masks for {len(images)} defect images"]
+    if missing:
+        parts.append(f"{len(missing)} defect images without a mask (e.g. {missing[0]})")
+    if extra:
+        parts.append(f"{len(extra)} masks with no matching defect image (e.g. {extra[0]})")
+    return "; ".join(parts) + ". Masks must be one binary image per defect photo, same file stem."
+
+
 def _validate_images(path: Path, extensions: list[str]) -> None:
     """Fail before training if an image cannot be fully decoded."""
     from PIL import Image
@@ -86,14 +109,21 @@ def build_datamodule(cfg: dict[str, Any], paths: Paths):
 
     # Optional test folders: only pass them once they actually hold images,
     # otherwise anomalib builds an empty test set and metrics come out as NaN.
-    for key, cfg_key in (
-        ("abnormal_dir", "abnormal_dir"),
-        ("normal_test_dir", "normal_test_dir"),
-        ("mask_dir", "mask_dir"),
-    ):
-        rel = ds.get(cfg_key)
-        if rel and _dir_has_images(root / rel, exts if key != "mask_dir" else exts + [".png"]):
+    for key in ("abnormal_dir", "normal_test_dir"):
+        rel = ds.get(key)
+        if rel and _dir_has_images(root / rel, exts):
             kwargs[key] = rel
+
+    # anomalib pairs masks with abnormal images by position, so the mask folder
+    # must hold exactly one file per abnormal image with the same stem. Anything
+    # else makes Folder() crash deep inside pandas; skip it with a warning instead.
+    mask_rel = ds.get("mask_dir")
+    if mask_rel and "abnormal_dir" in kwargs:
+        problem = _mask_dir_problem(root / kwargs["abnormal_dir"], root / mask_rel, exts + [".png"])
+        if problem is None:
+            kwargs["mask_dir"] = mask_rel
+        elif (root / mask_rel).is_dir():
+            print(f"[patchcore] ignoring mask_dir {mask_rel}: {problem}")
 
     # anomalib 1.x accepted image_size on the datamodule; 2.x does not.
     size = cfg.get("image", {}).get("size")
@@ -166,7 +196,10 @@ def load_patchcore(ckpt_path: Path | str, cfg: dict[str, Any] | None = None):
         return Patchcore.load_from_checkpoint(str(ckpt_path), weights_only=False, **kwargs)
 
 
-def build_engine(cfg: dict[str, Any], default_root_dir: Path):
+def build_engine(cfg: dict[str, Any], default_root_dir: Path, report_progress: bool = False):
+    """The anomalib Engine. `report_progress` adds a callback that prints a
+    `[progress]` line per batch (see `icinspect.progress`) for the window's
+    bar -- lightning's own bar only reaches a pipe when a stage ends."""
     from anomalib.engine import Engine
 
     t = cfg.get("trainer", {})
@@ -176,4 +209,59 @@ def build_engine(cfg: dict[str, Any], default_root_dir: Path):
         "max_epochs": t.get("max_epochs", 1),
         "default_root_dir": str(default_root_dir),
     }
+    if report_progress:
+        kwargs["callbacks"] = [progress_callback()]
     return Engine(**filter_kwargs(Engine.__init__, kwargs))
+
+
+def progress_callback():
+    """A lightning Callback printing `[progress]` per batch of each stage.
+
+    PatchCore's fit is one pass extracting features (one counter), then the
+    coreset selection, which has no batches and is announced as a status so
+    the bar does not look stuck, then validation and test with counters of
+    their own. Each stage restarts the count; the window restarts its ETA.
+    """
+    from lightning.pytorch.callbacks import Callback
+
+    from icinspect.progress import Reporter
+
+    class Report(Callback):
+        def __init__(self) -> None:
+            self._reporter: Reporter | None = None
+
+        def _begin(self, total: int) -> None:
+            self._reporter = Reporter(max(int(total), 1), every=0.5)
+
+        def _tick(self, done: int, text: str) -> None:
+            if self._reporter is not None:
+                self._reporter.step(done, text, force=done >= self._reporter.total)
+
+        def on_train_epoch_start(self, trainer, pl_module) -> None:
+            self._begin(trainer.num_training_batches)
+
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+            self._tick(batch_idx + 1, f"extracting features {batch_idx + 1}/{trainer.num_training_batches}")
+
+        def on_train_epoch_end(self, trainer, pl_module) -> None:
+            print("[patchcore] selecting the coreset (memory bank)...", flush=True)
+
+        def on_validation_epoch_start(self, trainer, pl_module) -> None:
+            total = sum(int(n) for n in _as_list(trainer.num_val_batches))
+            self._begin(total)
+
+        def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0) -> None:
+            self._tick(batch_idx + 1, f"validating {batch_idx + 1}/{self._reporter.total if self._reporter else '?'}")
+
+        def on_test_epoch_start(self, trainer, pl_module) -> None:
+            total = sum(int(n) for n in _as_list(trainer.num_test_batches))
+            self._begin(total)
+
+        def on_test_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0) -> None:
+            self._tick(batch_idx + 1, f"testing {batch_idx + 1}/{self._reporter.total if self._reporter else '?'}")
+
+    return Report()
+
+
+def _as_list(value) -> list:
+    return list(value) if isinstance(value, (list, tuple)) else [value]

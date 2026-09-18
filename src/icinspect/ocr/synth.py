@@ -115,12 +115,16 @@ def generate(
     label_file.parent.mkdir(parents=True, exist_ok=True)
     base = relative_to or label_file.parent
 
+    from icinspect.progress import Reporter
+
+    reporter = Reporter(count)
     lines: list[str] = []
     for i in range(count):
         text = random_marking(rng, min_len, max_len)
         img = render(text, rng.choice(fonts) if fonts else None, rng, height)
         name = f"synth_{i:06d}.png"
         img.save(out_dir / name)
+        reporter.step(i + 1, f"{i + 1}/{count} crops", force=i + 1 == count)
         try:
             rel = (out_dir / name).relative_to(base)
         except ValueError:

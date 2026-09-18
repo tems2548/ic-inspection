@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
 
     datamodule = build_datamodule(cfg, paths)
     model = build_model(cfg)
-    engine = build_engine(cfg, out_dir)
+    engine = build_engine(cfg, out_dir, report_progress=True)
 
     print(f"[patchcore] dataset : {paths.anomaly_root}")
     print(f"[patchcore] results : {out_dir}")

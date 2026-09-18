@@ -34,16 +34,22 @@ segment:
   max_lines: 0                      # auto: 0 = keep every line found | half: strips (0 -> 2)
   ink_frac: 0.02                    # min coverage counting as content (chip search), and the flat-profile floor
   line_threshold: 0.80              # fraction of the automatic (Otsu) level a line row must reach
+  line_hysteresis: 0.85             # a found line grows while its rows stay above this fraction of the level
   smooth_frac: 0.01                 # projection-profile smoothing window, fraction of the dimension
   min_contrast: 0.05                # a stroke must beat the local background by this much of full scale
+  stroke_frac: 0.01                 # ink-density window radius, fraction of the height (0 = raw ink pixels)
+  stroke_density: 0.15              # least share of ink in that window that still counts as a stroke
   min_line_frac: 0.05               # bands thinner than this fraction of the height are noise
-  merge_gap_frac: 0.02              # blank runs shorter than this join two bands
-  split_gap_frac: 0.40              # cut a line where a gap exceeds this many line heights (0 = never)
+  thin_line_frac: 0.70              # a line under this share of a full line's height is a faint line seen at its core: grow it to one
+  merge_gap_frac: 0.05              # blank runs shorter than this join two bands (a faint line reads as patches; lines sit ~0.10 apart)
+  split_gap_frac: 0.35              # cut a line where a gap exceeds this many line heights (0 = never)
+  min_part_frac: 0.50               # a segment narrower than this x its height is a blob of moulding, not a character
+  edge_mark_frac: 0.75              # ...and on the crop border, narrower than this is the pin-1 dimple or the bevel
   pad_frac: 0.25                    # vertical padding around a line, as a fraction of its height
   background_blur: 0.06             # illumination-estimate blur radius, fraction of the height
   trim_columns: true                # also cut leading/trailing blank columns
   chip_detect: true                 # crop to the package body before looking for text lines
-  chip_body_frac: 0.50              # a body row/column is this full of foreground; a lead row is not
+  chip_body_frac: 0.75              # a body row/column is this full of foreground (~0.97); a row of leads is ~0.55
   chip_inset: 0.08                  # pull the crop in off the moulding edge, fraction of the box
 
 train:

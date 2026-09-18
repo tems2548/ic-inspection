@@ -11,6 +11,7 @@ from tkinter import messagebox, ttk
 from icinspect.gui import widgets as w
 from icinspect.gui.runner import Progress
 from icinspect.gui.service import (
+    REGION_MANUAL,
     REGION_MODES,
     REGION_REFERENCE,
     Inspector,
@@ -34,7 +35,7 @@ from icinspect.ocr.segment import MODES
 VERSION = r"v\d+"   # anomalib's run folders: v1, v2, ...
 PART_SCORE_LINE = re.compile(r"^(\s*part_score\s*:\s*).*$", re.MULTILINE)
 REGION_COLOR = "#4a3aa7"    # the window that was scored, distinct from package and reads
-
+KIND_COLOR = "#e5534b"      # a damaged blob, labelled with what kind of defect it is
 
 def _percent(text: str) -> float | None:
     """A percentage typed into a box, as a share (0..1). Blank means no limit."""
@@ -161,6 +162,8 @@ class InspectTab(ttk.Frame):
         self.calibrate_button.pack(side="left", padx=8)
         self.cutoff_label = ttk.Label(part, text="", foreground="#8b949e")
         self.cutoff_label.pack(side="left")
+        self.box_label = ttk.Label(part, text="", foreground="#9a6700")
+        self.box_label.pack(side="left", padx=(10, 0))
 
         row2 = ttk.Frame(box)
         row2.grid(row=2, column=0, sticky="ew", pady=(4, 0))
@@ -238,13 +241,13 @@ class InspectTab(ttk.Frame):
         self.summary = ttk.Label(filters, text="", foreground="#8b949e")
         self.summary.pack(side="right")
 
-        columns = ("verdict", "score", "damage", "iou", "marking", "confidence", "reasons")
+        columns = ("verdict", "score", "damage", "kind", "iou", "marking", "confidence", "reasons")
         self.tree = ttk.Treeview(left, columns=columns, show="tree headings", selectmode="browse")
         self.tree.heading("#0", text="photo")
         self.tree.column("#0", width=180, stretch=True)
         for name, width, anchor in (
             ("verdict", 60, "center"), ("score", 70, "e"), ("damage", 70, "e"),
-            ("iou", 60, "e"), ("marking", 130, "w"), ("confidence", 70, "e"),
+            ("kind", 90, "w"), ("iou", 60, "e"), ("marking", 130, "w"), ("confidence", 70, "e"),
             ("reasons", 120, "w"),
         ):
             self.tree.heading(name, text=name)
@@ -279,6 +282,13 @@ class InspectTab(ttk.Frame):
                         command=self._show_selected).pack(side="left")
         ttk.Button(tools, text="Open folder",
                    command=self._reveal_current).pack(side="right")
+        # Drawing the package box by hand. The two buttons swap places: Draw
+        # box while looking, Apply / Cancel while drawing.
+        self.draw_button = ttk.Button(tools, text="Draw box", width=9, command=self._draw_box)
+        self.draw_button.pack(side="right", padx=(0, 8))
+        self.cancel_box_button = ttk.Button(tools, text="Cancel", width=7, command=self._cancel_box)
+        self.apply_box_button = ttk.Button(tools, text="Apply box", width=10,
+                                           command=self._apply_box, style="Accent.TButton")
 
         heat = ttk.Frame(right)
         heat.grid(row=2, column=0, sticky="ew", pady=(0, 3))
@@ -397,6 +407,10 @@ class InspectTab(ttk.Frame):
         if self.worker.busy:
             messagebox.showinfo("Busy", "Another job is already running.", parent=self)
             return
+        if self.view.editing:
+            messagebox.showinfo("Box not applied",
+                                "Apply or cancel the box you are drawing first.", parent=self)
+            return
         images = self._images()
         if not images:
             messagebox.showwarning("Nothing to inspect",
@@ -444,6 +458,13 @@ class InspectTab(ttk.Frame):
         failed = sum(1 for r in results if r.verdict == "FAIL")
         self.status.configure(text=f"{len(results)} inspected: {len(results) - failed} PASS / {failed} FAIL")
         self.app.log(f"[inspect] {len(results) - failed} PASS / {failed} FAIL", "ok" if not failed else None)
+        kinds: dict[str, int] = {}
+        for r in results:
+            if r.shape is not None and r.shape.kind != "none":
+                kinds[r.shape.label] = kinds.get(r.shape.label, 0) + 1
+        if kinds:
+            self.app.log("[inspect] defect kinds: " + ", ".join(
+                f"{label} {count}" for label, count in sorted(kinds.items(), key=lambda kv: -kv[1])))
         self._refill_tree()
         # The Stats tab plots this run, so it is stale the moment one finishes.
         stats_tab = getattr(self.app, "stats_tab", None)
@@ -481,6 +502,7 @@ class InspectTab(ttk.Frame):
                 result.verdict,
                 "" if result.deciding_score is None else f"{result.deciding_score:.4f}",
                 "" if result.damage_ratio is None else f"{result.damage_ratio * 100:.1f}%",
+                result.kind,
                 "" if result.iou is None else f"{result.iou:.3f}",
                 result.marking,
                 f"{result.confidence:.3f}" if result.reads else "",
@@ -525,9 +547,11 @@ class InspectTab(ttk.Frame):
             # the whole answer to "why did that count as a defect".
             with_size = _pixels(result.part, result.path)
             if with_size:
-                overlays.append(Overlay(with_size, REGION_COLOR, "scored region", dashed=True))
+                label = "drawn box" if result.part == self.inspector.manual_region() else "scored region"
+                overlays.append(Overlay(with_size, REGION_COLOR, label, dashed=True))
         if result.chip:
             overlays.append(Overlay(result.chip, CHIP_COLOR, "package"))
+        overlays.extend(self._blob_overlays(result))
         for position, seg in enumerate(result.segments):
             overlays.append(Overlay(
                 seg.box,
@@ -564,8 +588,36 @@ class InspectTab(ttk.Frame):
         self._show_detail(result)
         if result.chip and self.zoom_package.get() and mode != VIEW_PANELS:
             self.view.zoom_to(result.chip)
-        # Segments come after the region and package boxes in the overlay list.
-        self._chip_offset = (1 if result.part else 0) + (1 if result.chip else 0)
+        # Segments come after the region, package and blob boxes in the overlay list.
+        self._chip_offset = ((1 if result.part else 0) + (1 if result.chip else 0)
+                             + len(self._blob_overlays(result)))
+
+    def _blob_overlays(self, result: Result) -> list[Overlay]:
+        """One box per damaged blob, in photo pixels, the largest carrying the kind.
+
+        The map is at model resolution over the whole frame, so a blob's box
+        scales straight up to the photo. Only counted blobs are drawn: the
+        bevel strip and map noise were left out of the verdict too.
+        """
+        shape = result.shape
+        if shape is None or result.heat is None or not shape.blobs:
+            return []
+        from PIL import Image
+
+        try:
+            with Image.open(result.path) as img:
+                width, height = img.size
+        except Exception:
+            return []
+        mh, mw = result.heat.shape[:2]
+        boxes: list[Overlay] = []
+        for index, blob in enumerate(shape.blobs[:8]):
+            x1, y1, x2, y2 = blob.bbox
+            box = (int(x1 * width / mw), int(y1 * height / mh),
+                   int(x2 * width / mw), int(y2 * height / mh))
+            label = shape.label if index == 0 else f"{blob.area_frac * 100:.1f}%"
+            boxes.append(Overlay(box, KIND_COLOR, label, dashed=index > 0))
+        return boxes
 
     def _panels(self, result: Result):
         """anomalib's visualizer grid for this photo: image, image + map, map, mask."""
@@ -624,6 +676,8 @@ class InspectTab(ttk.Frame):
         if result.damage_ratio is not None:
             where = "of the part" if result.part else "of the frame"
             parts.append(f"damaged {result.damage_ratio * 100:.1f}% {where}")
+        if result.shape is not None and result.shape.kind != "none":
+            parts.append(f"kind: {result.shape.describe()}")
         self.detail.configure(text="   ".join(parts))
 
     def _zoom_package(self) -> None:
@@ -700,6 +754,8 @@ class InspectTab(ttk.Frame):
                 draw.rectangle(region, outline=REGION_COLOR, width=line)
             if result.chip:
                 draw.rectangle(result.chip, outline=CHIP_COLOR, width=line)
+            for blob in self._blob_overlays(result):
+                draw.rectangle(blob.box, outline=KIND_COLOR, width=line)
             for seg in result.segments:
                 draw.rectangle(seg.box, outline=IGNORED_COLOR if seg.ignored else READ_COLOR,
                                width=line)
@@ -721,6 +777,124 @@ class InspectTab(ttk.Frame):
         written = write_report(self.results, Path(chosen), self.expect.get().strip().upper())
         self.app.log(f"[inspect] report: {written}", "ok")
         self.status.configure(text=f"Saved {written.name}")
+
+    # -- drawing the package box -------------------------------------------
+
+    def _photo_for_drawing(self) -> Path | None:
+        """The photo to draw on: the selected result, else the first source photo."""
+        result = self._selected_result()
+        if result is not None:
+            return result.path
+        images = self._images()
+        return images[0] if images else None
+
+    def _draw_box(self) -> None:
+        """Start drawing the package box on the photo in the viewer."""
+        if self.view.editing:
+            return
+        photo = self._photo_for_drawing()
+        if photo is None:
+            messagebox.showinfo("Nothing to draw on",
+                                "Pick a photo (or a folder of photos) first.", parent=self)
+            return
+        result = self._selected_result()
+        if result is None or self.view.path != photo:
+            self.view.show(photo, [])
+            self.view.set_heat(None, None)
+        # Start from the box that already applies, so a small correction is a
+        # small drag: the drawn one, else the package the reader found, else
+        # the region learned from the good parts.
+        start = _pixels(self.inspector.manual_region(), photo)
+        if start is None and result is not None and result.chip:
+            start = result.chip
+        if start is None:
+            start = _pixels(self.inspector.reference_region(), photo)
+        self.view.begin_box_edit(start, on_change=self._box_changed)
+        self.view.reset_view()
+        self.draw_button.pack_forget()
+        self.cancel_box_button.pack(side="right", padx=(0, 8))
+        self.apply_box_button.pack(side="right", padx=(0, 4))
+        self._box_changed(start)
+
+    def _box_changed(self, box) -> None:
+        if box is None:
+            self.status.configure(text="Drag on the photo to draw the package box")
+            self.apply_box_button.configure(state="disabled")
+            return
+        x1, y1, x2, y2 = box
+        self.status.configure(text=f"Box {x1},{y1} - {x2},{y2}  ({x2 - x1}x{y2 - y1} px)"
+                                   "   drag a corner to resize, inside to move")
+        self.apply_box_button.configure(state="normal")
+
+    def _leave_drawing(self) -> None:
+        self.apply_box_button.pack_forget()
+        self.cancel_box_button.pack_forget()
+        self.draw_button.pack(side="right", padx=(0, 8))
+
+    def _show_after_drawing(self, photo: Path | None) -> None:
+        """Back to the normal view; without a result, keep the photo and its box up."""
+        if self._selected_result() is not None or photo is None:
+            self._show_selected()
+            return
+        box = _pixels(self.inspector.manual_region(), photo)
+        self.view.show(photo, [Overlay(box, REGION_COLOR, "drawn box", dashed=True)] if box else [])
+
+    def _cancel_box(self) -> None:
+        photo = self.view.path
+        self.view.end_box_edit()
+        self._leave_drawing()
+        self.status.configure(text="Box not changed")
+        self._show_after_drawing(photo)
+
+    def _apply_box(self) -> None:
+        """Keep the drawn box: it becomes the scored region and the package crop."""
+        from PIL import Image
+
+        box = self.view.end_box_edit()
+        photo = self.view.path
+        self._leave_drawing()
+        if box is None or photo is None:
+            self.status.configure(text="No box drawn")
+            self._show_after_drawing(photo)
+            return
+        try:
+            with Image.open(photo) as img:
+                width, height = img.size
+        except Exception as exc:
+            messagebox.showerror("Could not read the photo", str(exc), parent=self)
+            return
+        x1, y1, x2, y2 = box
+        region = (x1 / width, y1 / height, x2 / width, y2 / height)
+        try:
+            self.inspector.set_manual_region(region, drawn_on=photo)
+        except ValueError as exc:
+            messagebox.showerror("Bad box", str(exc), parent=self)
+            return
+        self.region_mode.set(REGION_MANUAL)
+        self.app.log(f"[part] box drawn on {photo.name}: {x1},{y1} - {x2},{y2}  "
+                     "({:.4f}, {:.4f}, {:.4f}, {:.4f} of the frame)".format(*region), "ok")
+        self._show_cutoff()
+        self._show_box()
+        self._show_after_drawing(photo)
+        self.status.configure(text="Box saved - run Inspect to use it")
+
+    def _show_box(self) -> None:
+        """Say what the drawn box is doing, next to the region picker."""
+        if not self.ignore_background.get():
+            self.box_label.configure(text="")
+            return
+        mode = self.region_mode.get()
+        region = self.inspector.manual_region()
+        if mode == REGION_MANUAL and region is None:
+            self.box_label.configure(
+                text="no box drawn yet - press Draw box under the photo", foreground="#9a6700")
+        elif mode == REGION_MANUAL:
+            self.box_label.configure(
+                text="box {:.0%},{:.0%} - {:.0%},{:.0%} of the frame, "
+                     "used for scoring and for the marking".format(*region),
+                foreground="#8b949e")
+        else:
+            self.box_label.configure(text="")
 
     # -- state -------------------------------------------------------------
 
@@ -760,6 +934,7 @@ class InspectTab(ttk.Frame):
 
     def _background_toggled(self) -> None:
         self._show_cutoff()
+        self._show_box()
         self._show_selected()
         if self.results:
             self.status.configure(text="Run again to score with the new setting")
@@ -872,6 +1047,7 @@ class InspectTab(ttk.Frame):
         ]
         self.model_label.configure(text="   ".join(parts))
         self._show_cutoff()
+        self._show_box()
         if not self.source.get():
             raw = self.inspector.paths().raw_root
             if raw.exists():

@@ -309,3 +309,75 @@ def test_splitting_can_be_turned_off():
     for x in range(190, 280, 16):
         draw.rectangle((x, 40, x + 8, 80), fill=210)
     assert len(auto_lines(img, {"segment": {"split_gap_frac": 0}})) == 1
+
+
+def big_marking(text="NE555P", size=(900, 300)):
+    """A marking at photo scale: default-font text is 11 px tall, and at that
+    size a speck plus padding is as wide as a letter."""
+    ImageFont = pytest.importorskip("PIL.ImageFont")
+    img = Image.new("L", size, 40)
+    try:
+        font = ImageFont.load_default(size=90)
+    except TypeError:                                   # Pillow < 10.1
+        pytest.skip("needs a scalable default font")
+    ImageDraw.Draw(img).text((200, 90), text, fill=220, font=font)
+    return img
+
+
+def test_a_narrow_mark_on_the_crop_border_is_not_a_segment(tmp_path):
+    """The pin-1 dimple: a notch flush against the crop edge, cut off as its
+    own segment by the gap rule, and read as a digit often enough to matter."""
+    img = big_marking()
+    ImageDraw.Draw(img).ellipse((-40, 100, 40, 200), fill=220)
+    found = auto_lines(img)
+    assert len(found) == 1, "the dimple does not get a segment of its own"
+    assert found[0].box[0] > 40, "and the text's segment does not start at it"
+
+
+def test_a_speck_beside_a_word_is_not_a_segment(tmp_path):
+    img = big_marking()
+    ImageDraw.Draw(img).rectangle((720, 130, 726, 170), fill=220)   # a fleck of texture
+    found = auto_lines(img)
+    assert len(found) == 1 and found[0].box[2] < 700
+
+
+def test_a_narrow_mark_is_kept_when_it_is_all_there_is(tmp_path):
+    img = Image.new("L", (60, 40), 40)
+    ImageDraw.Draw(img).ellipse((0, 12, 8, 26), fill=220)
+    assert len(auto_lines(img)) == 1, "a lone segment is never dropped: the reader decides"
+
+
+def test_a_bright_streak_on_the_crop_border_is_not_a_line():
+    """The lit bevel of the package: a solid band flush against the crop edge,
+    brighter than any text row. It must neither set the threshold nor be read."""
+    img = big_marking()
+    ImageDraw.Draw(img).rectangle((0, 282, 900, 300), fill=220)     # solid streak at the bottom
+    found = auto_lines(img)
+    assert [ln.index for ln in found] == [0]
+    assert found[0].box[3] < 260, "the streak is not a line of its own"
+
+
+def test_a_band_much_thinner_than_the_others_is_grown_to_a_full_line():
+    """A faint first line clears the threshold only at its densest rows."""
+    from icinspect.ocr.segment import _grow_thin_bands
+
+    rows = [(138, 191), (376, 548), (638, 807)]           # 53 tall next to ~170
+    grown = _grow_thin_bands(rows, 975, 0.7)
+    assert grown[1:] == rows[1:], "full lines are left alone"
+    top, bottom = grown[0]
+    assert bottom - top == pytest.approx(170, abs=2)
+    assert top < 138 and bottom > 191, "widened about its centre"
+    assert bottom <= 376, "never into the next line"
+
+
+def test_growing_stops_at_the_crop_and_at_a_neighbour():
+    from icinspect.ocr.segment import _grow_thin_bands
+
+    assert _grow_thin_bands([(0, 30), (60, 230)], 300, 0.7) == [(0, 60), (60, 230)]
+    assert _grow_thin_bands([(100, 270), (280, 300)], 300, 0.7) == [(100, 270), (270, 300)]
+
+
+def test_a_lone_band_is_not_grown():
+    from icinspect.ocr.segment import _grow_thin_bands
+
+    assert _grow_thin_bands([(10, 20)], 100, 0.7) == [(10, 20)]

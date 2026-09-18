@@ -196,8 +196,7 @@ def run_command(
     guard.start()
     try:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            prog.log(line.rstrip("\n"))
+        _stream(prog, proc.stdout)
     finally:
         stop.set()
         if proc.stdout is not None:
@@ -207,6 +206,42 @@ def run_command(
         prog.log("[stopped]")
         raise Cancelled
     return code
+
+
+def _stream(prog: Progress, stdout) -> None:
+    """Feed a child's output to the log, turning progress into bar steps.
+
+    A `[progress] done/total text` line (see `icinspect.progress`) becomes a
+    step and a status instead of a log line. lightning's own bars arrive the
+    same way -- "Fitting ━━━ 12/44" -- only they redraw with a carriage
+    return rather than a newline, so the read is character-wise and splits
+    on both: on `\r` the chunk is a bar update and only its counter is used;
+    on `\n` a real line is logged.
+    """
+    from icinspect.progress import parse_progress
+
+    buffer: list[str] = []
+    while True:
+        char = stdout.read(1)
+        if not char:
+            break
+        if char not in ("\r", "\n"):
+            buffer.append(char)
+            continue
+        text = "".join(buffer).rstrip()
+        buffer.clear()
+        found = parse_progress(text) if text else None
+        if found is not None:
+            done, total, label = found
+            prog.step(done, total)
+            if label:
+                prog.status(label)
+            if text.startswith("[progress]") or char == "\r":
+                continue                         # the bar shows it; the log need not
+        if char == "\n" and text:
+            prog.log(text)
+    if buffer:
+        prog.log("".join(buffer).rstrip())
 
 
 def python_module(module: str, *args: str) -> list[str]:

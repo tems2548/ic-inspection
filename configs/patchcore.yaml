@@ -13,14 +13,14 @@ dataset:
 
 model:
   backbone: "wide_resnet50_2"
-  layers: ["layer1", "layer2", "layer3"]
+  layers: ["layer1", "layer2", "layer3"]       # layer1 at 250px x 250 images needs ~5 GB GPU
   pre_trained: true
-  coreset_sampling_ratio: 0.15       # lower = smaller memory bank, faster inference
+  coreset_sampling_ratio: 0.1       # lower = smaller memory bank, faster inference
   num_neighbors: 9
 
 image:
-  size: [384, 384]                  # [height, width] fed to the backbone
-  center_crop: [384, 384]                # e.g. [224, 224] or null
+  size: [250, 250]                  # [height, width] fed to the backbone
+  center_crop: [250, 250]                  # e.g. [224, 224] or null
 
 trainer:
   accelerator: "auto"               # "gpu" | "cpu" | "auto"
@@ -40,4 +40,20 @@ threshold:
   # alone reaches. Fit it from test/good + test/defect with "Calibrate" on the
   # Inspect tab; null means the window falls back to anomalib's pixel line
   # (0.50), which is the right scale but the wrong calibration.
-  part_score: 0.3902   # fitted 2026-09-11: 46 good + 220 defective, fixed region, F1 1.00
+  part_score: 0.4393
+
+report:
+  # The reporting table on the Stats tab (escape and overkill rates, PRO,
+  # detection limit, repeatability, latency). Only the millimetre scale and
+  # the grouping of repeated shots need telling.
+  #
+  # The moulded body's size in mm, (along x, along y) as the part lies in the
+  # photo. The scored region is that body pulled in by segment.chip_inset, so
+  # this is what turns a mask's pixel area into a defect size in mm for the
+  # detection limit. NE555P is a PDIP-8; measure the part you inspect.
+  body_mm: [9.5, 6.35]
+  # Repeated shots of one part, for the repeatability sigma: a regex whose
+  # first group is the part id (A17_1.jpg, A17_2.jpg -> A17). A repeats.csv
+  # with image,part columns under anomaly/ic overrides it photo by photo.
+  repeats_pattern: '^(.+)[_-]\d+$'
+  repeats_file: "repeats.csv"

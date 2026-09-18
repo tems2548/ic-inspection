@@ -178,6 +178,10 @@ def main(argv: list[str] | None = None) -> int:
     history: list[dict] = []
     grad_clip = float(tcfg.get("grad_clip", 5.0))
 
+    from icinspect.progress import Reporter
+
+    per_epoch = max(len(train_loader), 1)
+    reporter = Reporter(epochs * per_epoch)
     for epoch in range(1, epochs + 1):
         model.train()
         started, running, batches = time.time(), 0.0, 0
@@ -200,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
             scaler.update()
             running += float(loss.detach())
             batches += 1
+            reporter.step((epoch - 1) * per_epoch + batches,
+                          f"epoch {epoch}/{epochs}  batch {batches}/{per_epoch}  "
+                          f"loss {running / batches:.4f}")
         scheduler.step()
 
         row = {"epoch": epoch, "loss": running / max(batches, 1), "seconds": time.time() - started}
@@ -211,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
         if "seq_accuracy" in row:
             msg += f"  char_acc {row['char_accuracy']:.4f}  seq_acc {row['seq_accuracy']:.4f}"
         print(msg + f"  ({row['seconds']:.1f}s)")
+        reporter.step(epoch * per_epoch, f"epoch {epoch}/{epochs} done", force=True)
 
         save(last_path, epoch, row)
         score = row.get("seq_accuracy", -row["loss"])

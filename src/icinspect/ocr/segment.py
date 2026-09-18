@@ -39,22 +39,35 @@ MODES = ("auto", "half", "none")
 # streak would otherwise push every real line below the cut.
 EDGE_STAT_FRAC = 0.02
 
+# A lit bevel of the moulding shows up as a solid streak flush against the crop
+# border, far brighter than any text row. It can reach this deep into the crop
+# (fraction of the dimension) and still be treated as border, and anything in
+# that zone brighter than the interior's brightest row by this factor is one.
+EDGE_STREAK_FRAC = 0.15
+EDGE_STREAK_FACTOR = 1.2
+
 # Defaults for the `segment:` block of configs/ocr.yaml.
 DEFAULTS = {
     "mode": "auto",
     "max_lines": 0,          # 0 = keep every line found
     "ink_frac": 0.02,        # minimum coverage that counts as content, and the flat-profile floor
     "line_threshold": 0.80,  # fraction of the automatic (Otsu) profile level a line row must reach
+    "line_hysteresis": 0.85, # a found line grows while rows stay above this fraction of the threshold
     "smooth_frac": 0.01,     # projection-profile smoothing window, fraction of the dimension
     "min_contrast": 0.05,    # a stroke must beat the local background by this much of full scale
+    "stroke_frac": 0.01,     # ink-density window radius, fraction of H (0 = use the raw ink pixels)
+    "stroke_density": 0.15,  # the least share of ink in that window that still counts as a stroke
     "min_line_frac": 0.05,   # bands thinner than this fraction of H are noise
-    "merge_gap_frac": 0.02,  # blank runs shorter than this join two bands
-    "split_gap_frac": 0.40,  # cut a line at gaps wider than this many line heights (0 = never)
+    "thin_line_frac": 0.70,  # a line under this share of a full line's height is grown to one
+    "merge_gap_frac": 0.05,  # blank runs shorter than this join two bands (faint text profiles are patchy)
+    "split_gap_frac": 0.35,  # cut a line at gaps wider than this many line heights (0 = never)
+    "min_part_frac": 0.50,   # a segment narrower than this x its height is a blob, not a character
+    "edge_mark_frac": 0.75,  # ...and on the crop border, narrower than this is the dimple or the bevel
     "pad_frac": 0.25,        # vertical padding, as a fraction of band height
     "background_blur": 0.06, # illumination-estimate blur radius, fraction of H
     "trim_columns": True,    # also cut leading/trailing blank columns
     "chip_detect": True,     # crop to the package before looking for text lines
-    "chip_body_frac": 0.50,  # a body row/column is this full of foreground; leads are not
+    "chip_body_frac": 0.75,  # a body row/column is this full of foreground (~0.97); a lead row is ~0.55
     "chip_inset": 0.08,      # pull the crop in off the moulding edge, fraction of the box
 }
 
@@ -136,19 +149,60 @@ def text_mask(ink: np.ndarray, min_contrast: float = DEFAULTS["min_contrast"]) -
     return ink >= max(_otsu(ink), float(min_contrast))
 
 
-def _bands(profile: np.ndarray, threshold: float, min_len: int, merge_gap: int) -> list[tuple[int, int]]:
-    """Contiguous runs at or above `threshold`, gap-merged then length-filtered."""
+def stroke_mask(img: Image.Image, cfg: dict | None = None) -> np.ndarray:
+    """Where the strokes are: the text mask, filled in at stroke scale.
+
+    A laser-etched marking is not solid ink -- it is a roughened patch of the
+    moulding, and the pixel mask inside a stroke is as speckled as the blank
+    package around it, only denser. Counting those pixels row by row leaves a
+    faint marking barely above the speckle floor, and two lines with a shallow
+    valley between them merge. So the mask is turned into a local ink density
+    (a box blur about one stroke wide) and thresholded again: a stroke reads
+    as solid, isolated speckle drops out, and the projection profile gets
+    valleys near zero. Otsu picks the split, floored at `stroke_density` so an
+    unmarked package -- whose density map has nothing to separate -- stays
+    empty. `stroke_frac: 0` skips the filling and returns the raw text mask.
+    """
+    s = segment_config(cfg)
+    mask = text_mask(ink_map(img, s["background_blur"]), s["min_contrast"])
+    radius = float(s["stroke_frac"]) * mask.shape[0]
+    if radius <= 0:
+        return mask
+    density = np.asarray(
+        Image.fromarray(mask.astype(np.uint8) * 255).filter(ImageFilter.BoxBlur(radius)),
+        dtype=np.float32,
+    ) / 255.0
+    return density >= max(_otsu(density), float(s["stroke_density"]))
+
+
+def _bands(
+    profile: np.ndarray,
+    threshold: float,
+    min_len: int,
+    merge_gap: int,
+    low: float | None = None,
+) -> list[tuple[int, int]]:
+    """Contiguous runs at or above `threshold`, gap-merged then length-filtered.
+
+    With `low`, a run is seeded at `threshold` and then grown outward for as
+    long as the profile stays at or above `low` (hysteresis). A faint line next
+    to a bold one only clears the threshold at its densest rows -- the middle
+    bar of an E, the waist of a 5 -- and without the growth it comes back as a
+    thin slice through the characters instead of the whole line.
+    """
     hot = profile >= threshold
+    warm = hot if low is None else (profile >= min(low, threshold))
 
     runs: list[list[int]] = []
     start: int | None = None
-    for i, on in enumerate(hot):
+    for i, on in enumerate(warm):
         if on and start is None:
             start = i
         elif not on and start is not None:
-            runs.append([start, i])
+            if hot[start:i].any():
+                runs.append([start, i])
             start = None
-    if start is not None:
+    if start is not None and hot[start:].any():
         runs.append([start, len(hot)])
 
     merged: list[list[int]] = []
@@ -160,6 +214,33 @@ def _bands(profile: np.ndarray, threshold: float, min_len: int, merge_gap: int) 
     return [(a, b) for a, b in merged if b - a >= min_len]
 
 
+def _stat_interior(profile: np.ndarray) -> np.ndarray:
+    """The part of a profile that gets a vote on where the threshold sits.
+
+    The fixed edge margin goes first. Then, within the outer `EDGE_STREAK_FRAC`
+    of either end, everything from the border up to the innermost row that is
+    brighter than any row in the middle of the profile is a streak, not text,
+    and goes too -- the whole run, so a streak with a dip in it does not leave
+    its inner half behind. A text line that sits in that zone and beats the
+    middle is excluded from the statistics as well; that only lowers the
+    threshold a little, and the line itself still gets thresholded.
+    """
+    n = len(profile)
+    edge = int(EDGE_STAT_FRAC * n)
+    zone = int(EDGE_STREAK_FRAC * n)
+    if not zone or n <= 2 * zone:
+        return profile[edge : n - edge] if edge and n > 2 * edge else profile
+    bright = float(profile[zone : n - zone].max()) * EDGE_STREAK_FACTOR
+    start, stop = edge, n - edge
+    hot = np.flatnonzero(profile[:zone] > bright)
+    if hot.size:
+        start = max(start, int(hot[-1]) + 1)
+    hot = np.flatnonzero(profile[n - zone :] > bright)
+    if hot.size:
+        stop = min(stop, n - zone + int(hot[0]))
+    return profile[start:stop] if stop > start else profile[zone : n - zone]
+
+
 def _profile_bands(
     profile: np.ndarray,
     bias: float,
@@ -167,6 +248,7 @@ def _profile_bands(
     min_len: int,
     merge_gap: int,
     smooth: int = 1,
+    hysteresis: float = 1.0,
 ) -> list[tuple[int, int]]:
     """Bands of a projection profile, thresholded relative to the profile itself.
 
@@ -178,12 +260,16 @@ def _profile_bands(
 
     Otsu sits a little high for this: text rows are a large minority class and
     the faint last line (date/lot code) falls under the cut. `bias` scales the
-    level down to take the fainter line's shoulders with it.
+    level down to take the fainter line's shoulders with it, and `hysteresis`
+    (a fraction of the biased level, 1.0 = off) lets a band that did clear the
+    cut grow out to where the profile really falls away.
 
-    Known limit: a bright, near-solid streak across the crop -- a specular
-    highlight along the package edge -- has higher row coverage than any text
-    line and will pull the threshold above the real lines. Raise `chip_inset`
-    to cut such an edge out of the crop entirely.
+    A bright, near-solid streak flush against the crop border -- the lit bevel
+    of the package, which `chip_inset` does not always clear -- has higher row
+    coverage than any text line and would pull the threshold above the real
+    lines. Such streaks are kept out of the statistics (see `_stat_interior`),
+    and the band they still form at the border is dropped for the same reason:
+    it is brighter than any row that was counted.
     """
     if smooth > 1:
         # Package speckle makes single rows jump around; without this the noise
@@ -191,13 +277,21 @@ def _profile_bands(
         pad = smooth // 2
         window = np.ones(smooth, dtype=np.float32) / smooth
         profile = np.convolve(np.pad(profile, pad, mode="edge"), window, mode="valid")[: len(profile)]
-    edge = int(EDGE_STAT_FRAC * len(profile))
-    interior = profile[edge : len(profile) - edge] if edge and len(profile) > 2 * edge else profile
+    interior = _stat_interior(profile)
     lo, hi = float(interior.min()), float(interior.max())
     if hi - lo < ink_frac:          # a profile this flat has no line structure
         return []
     threshold = _otsu((interior - lo) / (hi - lo)) * float(bias)
-    return _bands((profile - lo) / (hi - lo), threshold, min_len, merge_gap)
+    bands = _bands((profile - lo) / (hi - lo), threshold, min_len, merge_gap,
+                   low=threshold * float(hysteresis))
+    # The streak that was kept out of the statistics still clears the cut, as
+    # a band flush against the border. It is the one band brighter than any
+    # row that had a vote, which is how it is told from a text line there.
+    streak = EDGE_STREAK_FACTOR * hi
+    return [
+        (a, b) for a, b in bands
+        if not ((a == 0 or b == len(profile)) and float(profile[a:b].mean()) > streak)
+    ]
 
 
 def _column_segments(cols: list[tuple[int, int]], gap: int) -> list[tuple[int, int]]:
@@ -228,7 +322,7 @@ def _column_segments(cols: list[tuple[int, int]], gap: int) -> list[tuple[int, i
 def auto_lines(img: Image.Image, cfg: dict | None = None) -> list[Line]:
     """Find text lines by horizontal projection. Empty list if none stand out."""
     s = segment_config(cfg)
-    ink = text_mask(ink_map(img, s["background_blur"]), s["min_contrast"]).astype(np.float32)
+    ink = stroke_mask(img, cfg).astype(np.float32)
     h, w = ink.shape
     ink_frac, bias = float(s["ink_frac"]), float(s["line_threshold"])
     rows = _profile_bands(
@@ -238,6 +332,7 @@ def auto_lines(img: Image.Image, cfg: dict | None = None) -> list[Line]:
         min_len=max(4, int(float(s["min_line_frac"]) * h)),
         merge_gap=max(1, int(float(s["merge_gap_frac"]) * h)),
         smooth=max(1, int(float(s["smooth_frac"]) * h)),
+        hysteresis=float(s["line_hysteresis"]),
     )
     # The moulding rim survives cropping as a thin streak flush against the crop
     # border. Drop that, but only when it is much thinner than the real lines --
@@ -248,6 +343,7 @@ def auto_lines(img: Image.Image, cfg: dict | None = None) -> list[Line]:
             b for b in rows
             if not ((b[0] == 0 or b[1] == h) and (b[1] - b[0]) < 0.5 * typical)
         ] or rows
+    rows = _grow_thin_bands(rows, h, float(s["thin_line_frac"]))
     if not rows:
         return []
 
@@ -263,8 +359,13 @@ def auto_lines(img: Image.Image, cfg: dict | None = None) -> list[Line]:
 
         spans: list[tuple[int, int]] = [(0, w)]
         if s["trim_columns"]:
+            # A column only has to be ink or blank here, but its coverage runs
+            # from a bowl's two thin arcs (~0.2 of the line height) to a
+            # full-height stem (~1.0), and Otsu over that range lands above the
+            # bowls and cuts a D or an O off its word. The square root pulls
+            # the stems down towards the bowls and leaves blank at zero.
             cols = _profile_bands(
-                ink[y1:y2].mean(axis=0),
+                np.sqrt(ink[y1:y2].mean(axis=0)),
                 bias=bias,
                 ink_frac=ink_frac,
                 min_len=1,
@@ -274,18 +375,63 @@ def auto_lines(img: Image.Image, cfg: dict | None = None) -> list[Line]:
             if cols:
                 spans = _column_segments(cols, gap=int(float(s["split_gap_frac"]) * (y2 - y1)))
 
-        for part, (x1, x2) in enumerate(spans):
-            left, right = max(0, x1 - pad), min(w, x2 + pad)
+        boxes = [(max(0, x1 - pad), min(w, x2 + pad)) for x1, x2 in spans]
+        # Moulding gets cut off as segments of its own: the pin-1 dimple and
+        # the bevel reaching in from the crop border, and the odd blob of
+        # texture beside a word. None of it is as wide as a character. Judged
+        # on the padded box, a lone "1" comes out at about half its height; a
+        # blob is well under that, and a dimple on the border -- where no
+        # character of a centred marking sits -- under three quarters. Left
+        # in, one decodes to a confident digit often enough to matter.
+        if len(boxes) > 1:
+            height = bottom - top
+            blob = float(s["min_part_frac"]) * height
+            edge_mark = float(s["edge_mark_frac"]) * height
+            kept = [
+                (left, right) for left, right in boxes
+                if right - left >= blob
+                and not ((left == 0 or right == w) and right - left < edge_mark)
+            ]
+            boxes = kept or boxes
+        for part, (left, right) in enumerate(boxes):
             lines.append(
                 Line(i, (left, top, right, bottom), img.crop((left, top, right, bottom)), part=part)
             )
     return lines
 
 
+def _grow_thin_bands(rows: list[tuple[int, int]], h: int, frac: float) -> list[tuple[int, int]]:
+    """Give a band that came out much thinner than the others a full line's height.
+
+    The lines of a marking share one font, so they share one height. A band
+    under `frac` of it is a faint line seen only at its densest rows -- the
+    middle bar of the E, the waist of the 5 -- and a crop of that reads as
+    nothing. It is widened about its centre to the height of a full line,
+    stopping short of the crop's ends and of its neighbours. The full height
+    is the median of the taller half of the bands, so a merged pair does not
+    set it and a lone thin band beside one full line takes that line's.
+    """
+    if len(rows) < 2 or frac <= 0:
+        return rows
+    heights = sorted(b - a for a, b in rows)
+    full = float(np.median(heights[len(heights) // 2:]))
+    grown: list[tuple[int, int]] = []
+    for index, (a, b) in enumerate(rows):
+        if b - a >= frac * full:
+            grown.append((a, b))
+            continue
+        centre = (a + b) / 2.0
+        top, bottom = int(round(centre - full / 2)), int(round(centre + full / 2))
+        floor = rows[index - 1][1] if index else 0
+        ceiling = rows[index + 1][0] if index + 1 < len(rows) else h
+        grown.append((max(top, floor, 0), min(bottom, ceiling, h)))
+    return grown
+
+
 def ink_box(img: Image.Image, cfg: dict | None = None) -> tuple[int, int, int, int] | None:
     """Bounding box of the ink in `img`, padded. None when there is none."""
     s = segment_config(cfg)
-    ink = text_mask(ink_map(img, s["background_blur"]), s["min_contrast"]).astype(np.float32)
+    ink = stroke_mask(img, cfg).astype(np.float32)
     h, w = ink.shape
     ink_frac, bias = float(s["ink_frac"]), float(s["line_threshold"])
     rows = _profile_bands(ink.mean(axis=1), bias, ink_frac, min_len=1, merge_gap=max(1, int(0.05 * h)))
@@ -417,11 +563,20 @@ def _offset(lines: list[Line], dx: int, dy: int) -> list[Line]:
     ]
 
 
+def clamp_box(box: tuple[int, int, int, int], size: tuple[int, int]) -> tuple[int, int, int, int] | None:
+    """`box` cut down to the image, or None when nothing of it is inside."""
+    w, h = size
+    x1, y1 = max(0, int(box[0])), max(0, int(box[1]))
+    x2, y2 = min(w, int(box[2])), min(h, int(box[3]))
+    return (x1, y1, x2, y2) if x2 > x1 and y2 > y1 else None
+
+
 def split_image(
     image_path: Path,
     mode: str = "auto",
     cfg: dict | None = None,
     detect_chip: bool | None = None,
+    chip_box: tuple[int, int, int, int] | None = None,
 ) -> tuple[list[Line], tuple[int, int, int, int] | None]:
     """Segment one file into text lines, cropping to the chip package first.
 
@@ -429,6 +584,10 @@ def split_image(
     nothing readable comes back as the whole image, for the model to reject on
     confidence rather than for the caller to special-case. `chip_box` is None
     when no package was found, or when detection is off.
+
+    A `chip_box` passed in (source pixels) is used as the package instead of
+    searching for one -- a fixture holds every part in the same place, and a
+    box drawn once by hand beats a detector on a part too damaged to find.
     """
     if mode not in MODES:
         raise ValueError(f"Unknown split mode {mode!r}; expected one of {MODES}")
@@ -437,7 +596,10 @@ def split_image(
 
     s = segment_config(cfg)
     want_chip = bool(s["chip_detect"]) if detect_chip is None else detect_chip
-    chip_box = find_chip(img, cfg) if (want_chip and mode != "none") else None
+    if chip_box is not None and mode != "none":
+        chip_box = clamp_box(chip_box, img.size)
+    else:
+        chip_box = find_chip(img, cfg) if (want_chip and mode != "none") else None
     target = img.crop(chip_box) if chip_box else img
     dx, dy = (chip_box[0], chip_box[1]) if chip_box else (0, 0)
 

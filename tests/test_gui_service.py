@@ -62,7 +62,8 @@ def test_report_columns_match_the_pipeline_csv(tmp_path):
         "marking", "marking_lines", "ocr_confidence", "expected",
     ]
     assert columns[9:] == ["chip", "peak_score", "damage_ratio", "defect_area",
-                           "part_score", "truth", "iou", "decided_on", "part"]
+                           "part_score", "truth", "iou", "decided_on", "part",
+                           "defect_kind", "defect_detail", "defect_blobs"]
     assert "FAIL" in row and "marking-mismatch" in row and "LM358N" in row
     assert '"1,2,3,4"' in row
 
@@ -139,3 +140,23 @@ def test_options_defaults_match_the_cli_defaults():
     assert opts.check_anomaly and opts.check_ocr
     assert opts.min_char_confidence is None   # None means "whatever ocr.yaml says"
     assert opts.threshold is None
+
+
+def test_a_truncated_capture_is_skipped_not_fatal(tmp_path):
+    """anomalib stops its whole pass on one bad file; the window must not."""
+    from PIL import Image
+
+    from icinspect.gui.service import _readable
+
+    good = tmp_path / "good.png"
+    Image.new("L", (20, 20), 90).save(good)
+    bad = tmp_path / "bad.jpg"
+    bad.write_bytes(good.read_bytes()[:40])
+    messages = []
+
+    class Log:
+        def log(self, text):
+            messages.append(text)
+
+    assert _readable([good, bad], Log()) == [good]
+    assert messages and "bad.jpg" in messages[0]
