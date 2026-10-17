@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from icinspect.config import PROJECT_ROOT
+from icinspect.config import FROZEN, PROJECT_ROOT
 
 
 class Cancelled(Exception):
@@ -245,9 +245,17 @@ def _stream(prog: Progress, stdout) -> None:
 
 
 def python_module(module: str, *args: str) -> list[str]:
-    """`python -m <module> ...` using the interpreter the GUI is running under."""
+    """`python -m <module> ...` using the interpreter the GUI is running under.
+
+    In the packaged app there is no python.exe: the app's own exe runs the
+    module instead (see packaging/app_entry.py).
+    """
+    if FROZEN:
+        return [sys.executable, "--run-module", module, *args]
     return [sys.executable, "-m", module, *args]
 
 
 def python_script(script: Path, *args: str) -> list[str]:
+    if FROZEN:
+        return [sys.executable, "--run-script", str(script), *args]
     return [sys.executable, str(script), *args]

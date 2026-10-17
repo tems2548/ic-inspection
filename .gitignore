@@ -14,3 +14,7 @@ lightning_logs/
 # The dataset lives on the Desktop, outside this repo. Never vendor it in.
 data/
 dataset/
+
+# Packaged app (build_app.ps1)
+build/
+dist/

@@ -8,13 +8,16 @@ IC_DATASET_ROOT).
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# Packaged app (PyInstaller): configs/, results/ and scripts/ sit beside the exe.
+FROZEN = bool(getattr(sys, "frozen", False))
+PROJECT_ROOT = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parents[2]
 CONFIG_DIR = PROJECT_ROOT / "configs"
 
 
