@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
@@ -129,3 +130,81 @@ class Collapsible(ttk.Frame):
             self.body.grid(row=1, column=0, sticky="ew", padx=(12, 0))
         else:
             self.body.grid_forget()
+
+
+class ProgressMeter(ttk.Frame):
+    """A progress bar with the percentage and the time left beside it.
+
+    It pulses until the job first says how far along it is -- loading a model
+    has no count -- and becomes a real bar the moment it does. The time left
+    is the rate so far applied to what remains. A count that goes backwards or
+    changes its total is a new stage (lightning: fit, then validation, then
+    test), so the rate is measured afresh from there.
+    """
+
+    def __init__(self, master: tk.Misc, length: int = 260, **kwargs) -> None:
+        super().__init__(master, **kwargs)
+        self.bar = ttk.Progressbar(self, mode="determinate", length=length, maximum=1, value=0)
+        self.bar.grid(row=0, column=0)
+        self.label = ttk.Label(self, text="", width=18)
+        self.label.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self._started = time.monotonic()
+        self._stage_started = self._started
+        self._stage_offset = 0
+        self._last: tuple[int, int] | None = None
+
+    def start(self) -> None:
+        """A job began: pulse until its first step."""
+        self._started = time.monotonic()
+        self._stage_started = self._started
+        self._stage_offset = 0
+        self._last = None
+        self.bar.configure(mode="indeterminate")
+        self.bar.start(12)
+        self.label.configure(text="")
+
+    def advance(self, done_total: tuple[int, int]) -> None:
+        """A step from the job: `(done, total)`."""
+        done, total = done_total
+        if total <= 0:
+            return
+        done = max(0, min(done, total))
+        now = time.monotonic()
+        if self._last is None or done < self._last[0] or total != self._last[1]:
+            self._stage_started = now
+            self._stage_offset = done
+        self._last = (done, total)
+        if str(self.bar.cget("mode")) != "determinate":
+            self.bar.stop()
+            self.bar.configure(mode="determinate")
+        self.bar.configure(maximum=total, value=done)
+        advanced = done - self._stage_offset
+        remaining = ""
+        if advanced > 0 and done < total:
+            rate = (now - self._stage_started) / advanced
+            remaining = f"   {_hms(rate * (total - done))} left"
+        self.label.configure(text=f"{done / total * 100:.0f}%{remaining}")
+
+    def stop(self, finished: bool = False) -> None:
+        """The job ended. A finished one shows a full bar and how long it took."""
+        self.bar.stop()
+        if finished:
+            self.bar.configure(mode="determinate", maximum=1, value=1)
+            self.label.configure(text=f"100%   in {_hms(time.monotonic() - self._started)}")
+        else:
+            self.bar.configure(mode="determinate", maximum=1, value=0)
+            self.label.configure(text="")
+
+    @property
+    def fraction(self) -> float:
+        """How far the bar is, 0..1 (0 while it pulses)."""
+        if self._last is None:
+            return 0.0
+        done, total = self._last
+        return done / total
+
+
+def _hms(seconds: float) -> str:
+    from icinspect.progress import hms
+
+    return hms(seconds)

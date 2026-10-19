@@ -44,6 +44,7 @@ MASK_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 # Where the scored region comes from.
 REGION_REFERENCE = "normal part"   # fixed, learned from the good training parts
 REGION_PHOTO = "this photo"        # measured on the photo being inspected
+SCORE_WEIGHT = 2              # progress steps per photo scored, against 1 per photo read
 REGION_MANUAL = "drawn box"        # fixed, drawn by hand on a photo in the window
 REGION_MODES = (REGION_REFERENCE, REGION_PHOTO, REGION_MANUAL)
 REFERENCE_FILE = "part_region.json"
@@ -376,7 +377,7 @@ class Inspector:
         self.patchcore_config = patchcore_config
         self.paths_config = paths_config
         self._ocr: tuple[Path, Any, Any, dict, Any] | None = None
-        self._anomaly: tuple[Path, Any, Any] | None = None
+        self._anomaly: tuple[Path, Any, Any, Any] | None = None
         # A run can be pointed at a specific checkpoint -- an older PatchCore
         # version, or crnn_last.pt against crnn_best.pt -- instead of whatever
         # is newest. None means "the default", which is what the CLI uses.
@@ -572,7 +573,8 @@ class Inspector:
     # -- anomaly -----------------------------------------------------------
 
     def _load_anomaly(self, prog: Progress):
-        from icinspect.anomaly.common import build_engine, load_patchcore
+        """(model, engine, counter) -- loaded once, kept between inspections."""
+        from icinspect.anomaly.common import build_engine, load_patchcore, predict_counter
 
         ckpt = self.anomaly_checkpoint()
         if ckpt is None:
@@ -586,17 +588,33 @@ class Inspector:
         prog.log(f"[anomaly] checkpoint: {ckpt}")
         cfg = load_yaml(self.patchcore_config)
         model = load_patchcore(ckpt, cfg)
-        engine = build_engine(cfg, self.patchcore_dir())
-        self._anomaly = (ckpt, model, engine)
+        counter = predict_counter()
+        engine = build_engine(cfg, self.patchcore_dir(), callbacks=[counter])
+        self._anomaly = (ckpt, model, engine, counter)
         return self._anomaly[1:]
 
-    def score_anomaly(self, images: list[Path], opts: Options, prog: Progress) -> dict[str, dict]:
+    def score_anomaly(
+        self,
+        images: list[Path],
+        opts: Options,
+        prog: Progress,
+        total: int | None = None,
+        weight: int = 1,
+    ) -> dict[str, dict]:
+        """Score `images` with PatchCore, stepping the bar once per photo scored.
+
+        Each photo is `weight` steps and the steps run up to len(images) *
+        weight out of `total` (default: exactly that), so `inspect` can count
+        the scoring and the reading as one bar in proportion to their cost.
+        """
         import torch
 
         from icinspect.anomaly.infer_patchcore import _rows_from_batch
 
-        model, engine = self._load_anomaly(prog)
+        model, engine, counter = self._load_anomaly(prog)
         cfg = load_yaml(self.patchcore_config)
+        count = len(images)
+        total = total or count * weight
 
         # anomalib scores a directory, not a file list. Handing it the parent
         # folder would score all 56 captures to answer for the one photo that
@@ -607,20 +625,36 @@ class Inspector:
         # here and comes back as "anomaly-missing" with the reason in the log.
         images = _readable(images, prog)
         if not images:
+            prog.step(count * weight, total)
             return scored
+        done = count - len(images)              # the unreadable ones are already decided
+
+        def scored_batch(n: int) -> None:
+            nonlocal done
+            done = min(done + n, count)
+            prog.step(done * weight, total)
+            prog.status(f"Scoring defects {done}/{count}")
+            prog.check()                        # Stop ends the pass between batches
+
+        prog.status(f"Scoring defects 0/{count}")
+        prog.step(done * weight, total)
         started = time.perf_counter()
-        with torch.no_grad(), _staging(images) as (folders, back):
-            for i, folder in enumerate(folders):
-                prog.check()
-                prog.status(f"Scoring {i + 1}/{len(folders)}: {folder.name}")
-                for batch in engine.predict(model=model, data_path=str(folder)) or []:
-                    maps = _maps_from_batch(batch)
-                    for position, row in enumerate(_rows_from_batch(batch)):
-                        key = back.get(str(Path(row["image"]).resolve()))
-                        if key is not None:
-                            row["image"] = key
-                            row.update(maps[position] if position < len(maps) else {})
-                            scored[key] = row
+        counter.hook = scored_batch
+        try:
+            with torch.no_grad(), _staging(images) as (folders, back):
+                for folder in folders:
+                    prog.check()
+                    for batch in engine.predict(model=model, data_path=str(folder)) or []:
+                        maps = _maps_from_batch(batch)
+                        for position, row in enumerate(_rows_from_batch(batch)):
+                            key = back.get(str(Path(row["image"]).resolve()))
+                            if key is not None:
+                                row["image"] = key
+                                row.update(maps[position] if position < len(maps) else {})
+                                scored[key] = row
+        finally:
+            counter.hook = None
+        prog.step(count * weight, total)
         # The pass is batched, so each photo is charged an equal share of it.
         share = (time.perf_counter() - started) / max(len(scored), 1)
         for row in scored.values():
@@ -977,9 +1011,15 @@ class Inspector:
         # Anomaly scoring is one batched pass over the folder, so it happens
         # first and in full; the marking is then read photo by photo, and each
         # verdict is handed to the UI as it lands rather than at the end.
+        # One bar for the whole run: the scoring pass, then a step per photo
+        # read and decided. Scoring a photo costs about twice reading it (0.42 s
+        # against 0.19 s per photo, warm, on the RTX 5060 Ti), so it counts
+        # double and the time left holds steady across the change of stage.
+        scoring = len(images) * SCORE_WEIGHT if opts.check_anomaly else 0
+        total = scoring + len(images)
         anomaly: dict[str, dict] = {}
         if opts.check_anomaly:
-            anomaly = self.score_anomaly(images, opts, prog)
+            anomaly = self.score_anomaly(images, opts, prog, total=total, weight=SCORE_WEIGHT)
 
         read = self._ocr_reader(opts, prog) if opts.check_ocr else None
         ocr_cfg = load_yaml(self.ocr_config) if opts.ignore_background else None
@@ -1004,6 +1044,7 @@ class Inspector:
             key = str(image.resolve())
             started = time.perf_counter()
             if read is None:
+                prog.status(f"Deciding {index + 1}/{len(images)}: {image.name}")
                 chip, segments = None, []
             else:
                 prog.status(f"Reading marking {index + 1}/{len(images)}: {image.name}")
@@ -1063,7 +1104,7 @@ class Inspector:
             result.verdict = "FAIL" if reasons else "PASS"
             results.append(result)
             prog.partial(result)
-            prog.step(index + 1, len(images))
+            prog.step(scoring + index + 1, total)
         return results
 
 

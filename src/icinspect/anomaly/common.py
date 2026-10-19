@@ -196,10 +196,16 @@ def load_patchcore(ckpt_path: Path | str, cfg: dict[str, Any] | None = None):
         return Patchcore.load_from_checkpoint(str(ckpt_path), weights_only=False, **kwargs)
 
 
-def build_engine(cfg: dict[str, Any], default_root_dir: Path, report_progress: bool = False):
+def build_engine(
+    cfg: dict[str, Any],
+    default_root_dir: Path,
+    report_progress: bool = False,
+    callbacks: list | None = None,
+):
     """The anomalib Engine. `report_progress` adds a callback that prints a
     `[progress]` line per batch (see `icinspect.progress`) for the window's
-    bar -- lightning's own bar only reaches a pipe when a stage ends."""
+    bar -- lightning's own bar only reaches a pipe when a stage ends.
+    `callbacks` are added as they are (see `predict_counter`)."""
     from anomalib.engine import Engine
 
     t = cfg.get("trainer", {})
@@ -209,9 +215,50 @@ def build_engine(cfg: dict[str, Any], default_root_dir: Path, report_progress: b
         "max_epochs": t.get("max_epochs", 1),
         "default_root_dir": str(default_root_dir),
     }
+    extra = list(callbacks or [])
     if report_progress:
-        kwargs["callbacks"] = [progress_callback()]
+        extra.insert(0, progress_callback())
+    if extra:
+        kwargs["callbacks"] = extra
     return Engine(**filter_kwargs(Engine.__init__, kwargs))
+
+
+def predict_counter():
+    """A lightning Callback that hands each predict batch's image count to `hook`.
+
+    The window keeps one engine loaded across inspections, so the callback is
+    built with it and `hook` is pointed at the current run's progress for the
+    length of one `engine.predict`, then cleared. Whatever the hook raises --
+    the window's Stop -- ends the predict pass there.
+    """
+    from lightning.pytorch.callbacks import Callback
+
+    class Count(Callback):
+        def __init__(self) -> None:
+            self.hook = None
+
+        def on_predict_batch_end(self, trainer, pl_module, outputs, batch, batch_idx,
+                                 dataloader_idx=0) -> None:
+            if self.hook is not None:
+                self.hook(batch_images(batch))
+
+    return Count()
+
+
+def batch_images(batch) -> int:
+    """How many images an anomalib batch holds (1 when it cannot tell)."""
+    paths = getattr(batch, "image_path", None)
+    if paths is None and isinstance(batch, dict):
+        paths = batch.get("image_path")
+    if isinstance(paths, (list, tuple)):
+        return len(paths)
+    image = getattr(batch, "image", None)
+    if image is None and isinstance(batch, dict):
+        image = batch.get("image")
+    shape = getattr(image, "shape", None)
+    if shape is not None and len(shape) == 4:
+        return int(shape[0])
+    return 1
 
 
 def progress_callback():
