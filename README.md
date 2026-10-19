@@ -152,9 +152,26 @@ part, whether to find the package first, whether to save line crops, and
 **fail over __% of the part damaged**, which adds `damage-over-limit` as a
 failure reason.
 
-### 2.2 Train tab progress
+### 2.2 Progress
 
-Every training script prints `[progress] done/total text` lines
+Every long job shows one bar with the percentage and the time left beside it
+(`ProgressMeter` in [widgets.py](src/icinspect/gui/widgets.py)). It pulses
+while a model loads, which has no count, and becomes a real bar at the first
+step; when a job finishes it reads `100%  in 0:42`.
+
+**Inspect and Calibrate** count the whole run as one bar: the PatchCore pass
+advances per photo as each batch comes back (a lightning callback on the
+loaded engine, `predict_counter` in
+[common.py](src/icinspect/anomaly/common.py)), then the marking read advances
+per photo. A photo scored counts double, because scoring costs about twice
+reading (0.42 s against 0.19 s per photo, warm, on the RTX 5060 Ti), so the
+time left holds steady across the change of stage — over the 64 `raw/` photos
+it predicted the finish to within a few seconds from a third of the way in.
+The status beside the bar says which stage it is in (`Scoring defects 30/64`,
+`Reading marking 14/64: P00121.jpg`), and **Stop** now also ends the scoring
+pass between batches rather than waiting for it to finish.
+
+**Train**: every training script prints `[progress] done/total text` lines
 ([progress.py](src/icinspect/progress.py)); the window turns them into the
 bar, a percentage and a time-remaining estimate, and lightning's own
 `Fitting ━━━ 12/44` bars are understood too. The ETA restarts at each stage
@@ -671,6 +688,7 @@ pytest -m "not slow"    # skip the CTC overfit smoke test
 | `test_anomaly_shape.py` | blob measurement and every defect-kind rule |
 | `test_anomaly_glue.py` | anomalib API tolerance |
 | `test_progress.py` | the progress protocol, lightning bar parsing, child-output streaming, the PatchCore callback on a tiny lightning run |
+| `test_gui_progress_meter.py` | the meter (pulse, count, time left, stage restart, finish), predict-batch counting, and one bar running forward across scoring and reading |
 | `test_gui_service.py`, `test_gui_region.py`, `test_gui_background.py`, `test_gui_damage.py`, `test_gui_metrics.py`, `test_gui_drawn_box.py` | the window's decisions: reads, report columns, one-photo staging, scored region, calibration, damage share, confusion matrix and IoU, the drawn box |
 | `test_gui_report.py` | Wilson intervals, AUROC, per-region overlap, pooled σ, the detection-limit rule, the mm scale, repeat grouping, and every row of the table |
 | `test_gui_stats.py`, `test_gui_models.py` | heat ramp, charts (headless Agg), JET, checkpoint picker |
@@ -699,6 +717,7 @@ Environment: RTX 5060 Ti, Python 3.11.16, torch 2.11.0+cu128, anomalib 2.6.0.
 | 2026-09-18 | Harvest: 2 132 labelled crops from 533 parts across four sources, 533 per label, no duplicates; the six truncated JPEGs on the external drive skipped and logged. Detector `v19`: anomalib whole-frame image AUROC 0.951 / F1 0.967 on `test/good` + `test/defect`; part-only cutoff calibrated at **0.4393**. Train-tab progress bar verified against the OCR trainer, the synthetic generator and a PatchCore run. |
 | 2026-09-18 | Reporting table over 20 `test/good` + 40 `test/defect` photos (detector `v19`, cutoff 0.4393): AUROC 1.0000; escape rate 0.00 % (95 % CI 0.00–8.76 %, n = 40); overkill rate 0.00 % (95 % CI 0.00–16.11 %, n = 20); latency 572 ms/unit warm on the RTX 5060 Ti. PRO and detection limit blank: `ground_truth/defect` holds no masks yet. |
 | 2026-09-18 | `pytest`: 265 passed. |
+| 2026-10-19 | Inspect-tab progress bar on the 64 `raw/` photos: per-photo steps through scoring and reading, time left within a few seconds of the real finish, Stop ends the scoring pass mid-way and the next run works. `pytest`: 271 passed. |
 
 The early PatchCore figures were on generated images and say nothing about
 real parts; the real-part figures are on one fixture and one part type.

@@ -13,14 +13,14 @@ dataset:
 
 model:
   backbone: "wide_resnet50_2"
-  layers: ["layer1", "layer2", "layer3"]       # layer1 at 250px x 250 images needs ~5 GB GPU
+  layers: ["layer1", "layer2", "layer3"]       # layer1 at 300px x 300px images needs ~5 GB GPU
   pre_trained: true
   coreset_sampling_ratio: 0.1       # lower = smaller memory bank, faster inference
   num_neighbors: 9
 
 image:
-  size: [250, 250]                  # [height, width] fed to the backbone
-  center_crop: [250, 250]                  # e.g. [224, 224] or null
+  size: [250, 250]                 # [height, width] fed to the backbone
+  center_crop: [250, 250]                # e.g. [224, 224] or null
 
 trainer:
   accelerator: "auto"               # "gpu" | "cpu" | "auto"

@@ -219,8 +219,8 @@ class InspectTab(ttk.Frame):
         self.run_button.grid(row=0, column=0)
         self.stop_button = ttk.Button(bar, text="Stop", command=self.worker.cancel, state="disabled")
         self.stop_button.grid(row=0, column=1, padx=6)
-        self.progress = ttk.Progressbar(bar, mode="determinate", length=160)
-        self.progress.grid(row=0, column=2, padx=6)
+        self.meter = w.ProgressMeter(bar, length=220)
+        self.meter.grid(row=0, column=2, padx=6)
         self.status = ttk.Label(bar, text="Ready", foreground="#8b949e")
         self.status.grid(row=0, column=3, sticky="w")
 
@@ -425,7 +425,6 @@ class InspectTab(ttk.Frame):
         self.tree.delete(*self.tree.get_children())
         self.reads.delete(*self.reads.get_children())
         self.view.show(None)
-        self.progress.configure(value=0, maximum=len(images))
         self._busy(True)
         self.app.log(f"[inspect] {len(images)} image(s) from {self.source.get()}")
 
@@ -438,8 +437,7 @@ class InspectTab(ttk.Frame):
             task,
             on_log=self.app.log,
             on_status=lambda text: self.status.configure(text=text),
-            on_progress=lambda done_total: self.progress.configure(
-                value=done_total[0], maximum=max(done_total[1], 1)),
+            on_progress=self.meter.advance,
             on_partial=self._add_result,
             on_done=self._finished,
             on_error=self._failed,
@@ -448,12 +446,16 @@ class InspectTab(ttk.Frame):
         if not started:
             self._busy(False)
 
-    def _busy(self, running: bool) -> None:
+    def _busy(self, running: bool, finished: bool = False) -> None:
         self.run_button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
+        if running:
+            self.meter.start()
+        else:
+            self.meter.stop(finished=finished)
 
     def _finished(self, results: list[Result]) -> None:
-        self._busy(False)
+        self._busy(False, finished=True)
         self.results = results
         failed = sum(1 for r in results if r.verdict == "FAIL")
         self.status.configure(text=f"{len(results)} inspected: {len(results) - failed} PASS / {failed} FAIL")
@@ -978,8 +980,7 @@ class InspectTab(ttk.Frame):
             task,
             on_log=self.app.log,
             on_status=lambda text: self.status.configure(text=text),
-            on_progress=lambda done_total: self.progress.configure(
-                value=done_total[0], maximum=max(done_total[1], 1)),
+            on_progress=self.meter.advance,
             on_done=self._calibrated,
             on_error=self._failed,
             on_cancelled=lambda _p: (self._busy(False), self.status.configure(text="Stopped")),
@@ -988,7 +989,7 @@ class InspectTab(ttk.Frame):
             self._busy(True)
 
     def _calibrated(self, best: dict) -> None:
-        self._busy(False)
+        self._busy(False, finished=True)
         self._show_cutoff()
         self.status.configure(text=f"Cutoff {best['threshold']:.4f}  F1 {best['f1']:.4f}")
         good = [s for s, y in best["scores"] if y == 0]

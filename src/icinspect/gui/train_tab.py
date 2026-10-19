@@ -13,11 +13,9 @@ from tkinter import messagebox, ttk
 from pathlib import Path
 
 import re
-import time
 
 from icinspect.config import PROJECT_ROOT
 from icinspect.gui import widgets as w
-from icinspect.progress import hms
 from icinspect.gui.runner import Progress, python_module, python_script, run_command
 from icinspect.gui.service import Options, Result
 from icinspect.ocr.dataset import list_images
@@ -152,10 +150,8 @@ class TrainTab(ttk.Frame):
         bar.columnconfigure(3, weight=1)
         self.stop_button = ttk.Button(bar, text="Stop", command=self.worker.cancel, state="disabled")
         self.stop_button.grid(row=0, column=0)
-        self.progress = ttk.Progressbar(bar, mode="indeterminate", length=260)
-        self.progress.grid(row=0, column=1, padx=8)
-        self.percent = ttk.Label(bar, text="", width=16)
-        self.percent.grid(row=0, column=2, sticky="w")
+        self.meter = w.ProgressMeter(bar, length=260)
+        self.meter.grid(row=0, column=1, columnspan=2, padx=8, sticky="w")
         self.status = ttk.Label(bar, text="Ready", foreground="#8b949e")
         self.status.grid(row=0, column=3, sticky="w")
         ttk.Button(bar, text="Open results folder",
@@ -323,7 +319,7 @@ class TrainTab(ttk.Frame):
             task,
             on_log=self.app.log,
             on_status=self._status_text,
-            on_progress=self._advance,
+            on_progress=self.meter.advance,
             on_done=lambda code: self._finished(title, code),
             on_error=self._failed,
             on_cancelled=lambda _p: self._settle("Stopped"),
@@ -336,43 +332,13 @@ class TrainTab(ttk.Frame):
             button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
         self._title = title
-        self._started = time.time()
-        self._stage_started = self._started
-        self._stage = ""
-        self._last_step: tuple[int, int] | None = None
         if running:
             # Pulsing until the job says how far along it is; a bar with a
             # number the moment it does.
-            self.progress.configure(mode="indeterminate")
-            self.progress.start(12)
+            self.meter.start()
             self.status.configure(text=f"{title}...")
-            self.percent.configure(text="")
         else:
-            self.progress.stop()
-            self.progress.configure(mode="determinate", value=0, maximum=1)
-            self.percent.configure(text="")
-
-    def _advance(self, done_total: tuple[int, int]) -> None:
-        """A step from the job: switch the bar to a real one and move it."""
-        done, total = done_total
-        if total <= 0:
-            return
-        if self._last_step is None or done < self._last_step[0] or total != self._last_step[1]:
-            # A new stage (lightning goes Fitting -> Validation -> Testing, each
-            # with its own counter), so the ETA starts over from here.
-            self._stage_started = time.time()
-            self._stage_offset = done
-        self._last_step = (done, total)
-        if str(self.progress.cget("mode")) != "determinate":
-            self.progress.stop()
-            self.progress.configure(mode="determinate")
-        self.progress.configure(maximum=total, value=done)
-        advanced = done - getattr(self, "_stage_offset", 0)
-        remaining = ""
-        if advanced > 0 and done < total:
-            rate = (time.time() - self._stage_started) / advanced
-            remaining = f"   {hms(rate * (total - done))} left"
-        self.percent.configure(text=f"{done / total * 100:.0f}%{remaining}")
+            self.meter.stop()
 
     def _status_text(self, text: str) -> None:
         """The job's own words, kept short: the bar and the percentage do the rest.
